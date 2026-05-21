@@ -1,0 +1,41 @@
+{
+  "name": "@secapi/cli",
+  "version": "0.2.0",
+  "description": "SEC API CLI for SEC data shaped for investors and agents",
+  "type": "module",
+  "bin": {
+    "secapi": "dist/index.js",
+    "omni-sec": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outfile dist/index.js --target node && chmod +x dist/index.js",
+    "test": "bun test src/index.test.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "sec",
+    "edgar",
+    "filings",
+    "sec-api",
+    "financial-data",
+    "cli",
+    "agent",
+    "mcp"
+  ],
+  "license": "MIT",
+  "homepage": "https://secapi.ai/developers",
+  "bugs": {
+    "url": "https://docs.secapi.ai/support"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/secapi-ai/secapi-cli.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
