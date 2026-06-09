@@ -7,7 +7,7 @@ import {
   listPromptsByPersona,
   type AgentPrompt,
   type AgentPromptPersona,
-} from "@omni-datastream/contracts"
+} from "./generated-contracts/agent-prompts.js"
 import { SecApiClient } from "@secapi/sdk-js"
 
 const args = process.argv.slice(2)
