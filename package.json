@@ -11,11 +11,15 @@
     "dist"
   ],
   "dependencies": {
-    "@secapi/contracts": "workspace:*",
-    "@secapi/sdk-js": "workspace:*"
+    "@secapi/sdk-js": "^0.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
   },
   "scripts": {
     "build": "bun build src/index.ts --outfile dist/index.js --target node && chmod +x dist/index.js",
+    "prepack": "bun run build",
     "test": "bun test src/index.test.ts",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run build"

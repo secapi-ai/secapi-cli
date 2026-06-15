@@ -8,8 +8,8 @@ import {
   listPromptsByPersona,
   type AgentPrompt,
   type AgentPromptPersona,
-} from "../../contracts/src/index.ts"
-import { SecApiClient } from "../../sdk-js/src/index.ts"
+} from "./generated-contracts/agent-prompts.js"
+import { SecApiClient } from "@secapi/sdk-js"
 
 const args = process.argv.slice(2)
 const baseUrl = envCredential("SECAPI_BASE_URL", "SECAPI_API_BASE_URL", "OMNI_DATASTREAM_BASE_URL", "OMNI_DATASTREAM_API_BASE_URL") ?? "https://api.secapi.ai"

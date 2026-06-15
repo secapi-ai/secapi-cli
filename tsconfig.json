@@ -1,25 +1,17 @@
 {
-  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "rootDir": "..",
-    "allowImportingTsExtensions": true,
-    "paths": {
-      "@secapi/contracts": [
-        "../contracts/src/index.ts"
-      ],
-      "@secapi/sdk-js": [
-        "../sdk-js/src/index.ts"
-      ]
-    }
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "declaration": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"],
+    "rootDir": "src"
   },
-  "include": [
-    "src/**/*.ts",
-    "../contracts/src/**/*.ts",
-    "../sdk-js/src/**/*.ts"
-  ],
-  "exclude": [
-    "**/*.test.ts",
-    "../contracts/src/**/*.test.ts",
-    "../sdk-js/src/**/*.test.ts"
-  ]
+  "include": ["src/**/*.ts"],
+  "exclude": ["**/*.test.ts"]
 }
