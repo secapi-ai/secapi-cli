@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs"
 import {
   AGENT_PROMPT_LIBRARY,
   AGENT_PROMPT_PERSONAS,
@@ -7,11 +8,11 @@ import {
   listPromptsByPersona,
   type AgentPrompt,
   type AgentPromptPersona,
-} from "./generated-contracts/agent-prompts.js"
-import { SecApiClient } from "@secapi/sdk-js"
+} from "../../contracts/src/index.ts"
+import { SecApiClient } from "../../sdk-js/src/index.ts"
 
 const args = process.argv.slice(2)
-const baseUrl = envCredential("SECAPI_BASE_URL", "SECAPI_API_BASE_URL", "OMNI_DATASTREAM_BASE_URL") ?? "https://api.secapi.ai"
+const baseUrl = envCredential("SECAPI_BASE_URL", "SECAPI_API_BASE_URL", "OMNI_DATASTREAM_BASE_URL", "OMNI_DATASTREAM_API_BASE_URL") ?? "https://api.secapi.ai"
 const STDIN_FLAG_NAME = "--api-key-stdin"
 const STDIN_BEARER_FLAG_NAME = "--bearer-token-stdin"
 const REJECTED_CREDENTIAL_FLAGS = new Set(["--api-key", "--bearer-token"])
@@ -35,7 +36,7 @@ function formatPersonasHuman() {
     console.log(`    ${DIM}${meta.summary}${RESET}`)
   }
   console.log("")
-  console.log(`${DIM}Run 'secapi agents prompts list --persona <slug>' to see prompts for a persona. Legacy alias: omni-sec.${RESET}`)
+  console.log(`${DIM}Run 'secapi agents prompts list --persona <slug>' to see prompts for a persona. ${RESET}`)
 }
 
 function formatPromptsListHuman(persona: AgentPromptPersona | null, prompts: AgentPrompt[], totalCount: number) {
@@ -123,6 +124,10 @@ function print(value: unknown) {
   console.log(JSON.stringify(value, null, 2))
 }
 
+function printRaw(value: string) {
+  process.stdout.write(value.endsWith("\n") ? value : `${value}\n`)
+}
+
 function getNumberFlag(name: string) {
   const raw = getFlag(name)
   if (raw === undefined) return undefined
@@ -146,6 +151,84 @@ function getNullableIntegerFlag(name: string) {
 
 function getListFlag(name: string) {
   return getFlag(name)?.split(",").map((value) => value.trim()).filter(Boolean)
+}
+
+function getBooleanFlag(name: string) {
+  if (!hasFlag(name)) return undefined
+  const raw = getFlag(name)
+  if (raw === undefined || raw.startsWith("--")) return true
+  const normalized = raw.trim().toLowerCase()
+  if (["1", "true", "yes", "on"].includes(normalized)) return true
+  if (["0", "false", "no", "off"].includes(normalized)) return false
+  throw new Error(`${name} must be true or false`)
+}
+
+function parseJsonValue(raw: string, label: string): unknown {
+  try {
+    return JSON.parse(raw)
+  } catch (error) {
+    throw new Error(`${label} must be valid JSON`)
+  }
+}
+
+function getJsonInput(jsonFlag: string, fileFlag: string, label: string) {
+  const inline = getFlag(jsonFlag)
+  const file = getFlag(fileFlag)
+  if (inline && file) throw new Error(`Use only one of ${jsonFlag} or ${fileFlag}`)
+  if (inline) return parseJsonValue(inline, label)
+  if (file) return parseJsonValue(readFileSync(file, "utf8"), label)
+  return undefined
+}
+
+function getObjectInput(jsonFlag: string, fileFlag: string, label: string) {
+  const value = getJsonInput(jsonFlag, fileFlag, label)
+  if (value === undefined) return undefined
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON object`)
+  }
+  return value as Record<string, unknown>
+}
+
+function getArrayInput(jsonFlag: string, fileFlag: string, label: string) {
+  const value = getJsonInput(jsonFlag, fileFlag, label)
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON array`)
+  }
+  return value
+}
+
+function getRequiredHoldings() {
+  const holdings = getArrayInput("--holdings-json", "--holdings-file", "holdings")
+  if (!holdings) throw new Error("--holdings-json or --holdings-file is required")
+  return holdings as Array<{ symbol: string; weight: number; shares?: number | null; costBasis?: number | null }>
+}
+
+function factorResponseParams() {
+  return {
+    response_mode: (getFlag("--response-mode") ?? getFlag("--view")) as any,
+    include: getListFlag("--include") ?? getListFlag("--expand"),
+  }
+}
+
+function factorKeySelectionParams() {
+  return {
+    keys: getListFlag("--keys") ?? getListFlag("--factors"),
+    category: getFlag("--category"),
+    window: getFlag("--window"),
+    lookback: getFlag("--lookback"),
+    ...factorResponseParams(),
+  }
+}
+
+function portfolioWorkflowBody() {
+  return {
+    country: getFlag("--country"),
+    lookback: getFlag("--lookback"),
+    category: getFlag("--category"),
+    keys: getListFlag("--keys") ?? getListFlag("--factors"),
+    holdings: getRequiredHoldings(),
+  }
 }
 
 type CliCredentials = {
@@ -248,8 +331,29 @@ function humanClient(credentials: CliCredentials) {
   })
 }
 
+function cliVersion(): string {
+  // dist/index.js sits one level below the published package root, so package.json
+  // resolves via ../package.json. In-repo (src/index.ts) it resolves via ../package.json too.
+  try {
+    const pkgUrl = new URL("../package.json", import.meta.url)
+    const pkg = JSON.parse(readFileSync(pkgUrl, "utf8")) as { version?: string }
+    if (typeof pkg.version === "string" && pkg.version) return pkg.version
+  } catch {
+    // fall through to unknown
+  }
+  return "unknown"
+}
+
 async function main() {
   rejectCredentialArgvFlags()
+
+  // --version / -v must short-circuit before help fallback so they print the bare
+  // version rather than the full command banner.
+  if (args[0] === "--version" || args[0] === "-v" || args[0] === "version") {
+    printRaw(cliVersion())
+    return
+  }
+
   const credentials = await resolveCredentials()
   const [group = "help", command = ""] = args
   const apiClient = defaultClient(credentials)
@@ -430,7 +534,7 @@ async function main() {
   if (group === "agents" && command === "prompts") {
     const subverb = args[2]
     if (!subverb || subverb.startsWith("-")) {
-      throw new Error("Usage: secapi agents prompts <list|read|copy> [...] (legacy alias: omni-sec)")
+      throw new Error("Usage: secapi agents prompts <list|read|copy> [...]")
     }
 
     if (subverb === "list") {
@@ -473,7 +577,7 @@ async function main() {
       const id = args[3]
       if (!id || id.startsWith("-")) {
         throw new Error(
-          "Usage: secapi agents prompts read <id>. Run 'secapi agents prompts list' to see IDs. Legacy alias: omni-sec.",
+          "Usage: secapi agents prompts read <id>. Run 'secapi agents prompts list' to see IDs. ",
         )
       }
       const prompt = getPrompt(id)
@@ -494,7 +598,7 @@ async function main() {
       const id = args[3]
       if (!id || id.startsWith("-")) {
         throw new Error(
-          "Usage: secapi agents prompts copy <id>. Pipe to clipboard via | pbcopy (macOS), | xclip -selection clipboard (Linux), or | clip (Windows). Legacy alias: omni-sec.",
+          "Usage: secapi agents prompts copy <id>. Pipe to clipboard via | pbcopy (macOS), | xclip -selection clipboard (Linux), or | clip (Windows). ",
         )
       }
       const prompt = getPrompt(id)
@@ -670,6 +774,35 @@ async function main() {
     return
   }
 
+  if (group === "search" && command === "fulltext") {
+    const q = getFlag("--q") ?? getFlag("--query")
+    if (!q) throw new Error("--q or --query is required")
+    print(await apiClient.searchFulltext({
+      q,
+      ticker: getFlag("--ticker"),
+      cik: getFlag("--cik"),
+      form: getFlag("--form"),
+      limit: getNumberFlag("--limit"),
+    }))
+    return
+  }
+
+  if (group === "search" && command === "semantic") {
+    const q = getFlag("--q") ?? getFlag("--query")
+    if (!q) throw new Error("--q or --query is required")
+    print(await apiClient.semanticSearch({
+      q,
+      ticker: getFlag("--ticker"),
+      cik: getFlag("--cik"),
+      form: getFlag("--form"),
+      filing_year: getNumberFlag("--filing-year"),
+      mode: getFlag("--mode") as "keyword" | "semantic" | "hybrid" | undefined,
+      limit: getNumberFlag("--limit"),
+      view: getFlag("--view") as any,
+    }))
+    return
+  }
+
   if (group === "sections" && command === "get") {
     print(await apiClient.latestSection({
       ticker: getFlag("--ticker"),
@@ -831,7 +964,7 @@ async function main() {
 
   if (group === "dilution" && command === "event") {
     const eventId = getFlag("--event-id")
-    if (!eventId) throw new Error("Usage: secapi dilution event --event-id <id> [--view agent] (legacy alias: omni-sec)")
+    if (!eventId) throw new Error("Usage: secapi dilution event --event-id <id> [--view agent]")
     print(await apiClient.dilutionEventDetail(eventId, { view: getFlag("--view") as any }))
     return
   }
@@ -959,7 +1092,7 @@ async function main() {
 
   if (group === "dilution" && command === "score") {
     const ticker = getFlag("--ticker")
-    if (!ticker) throw new Error("Usage: secapi dilution score --ticker <symbol> [--view agent] (legacy alias: omni-sec)")
+    if (!ticker) throw new Error("Usage: secapi dilution score --ticker <symbol> [--view agent]")
     print(await apiClient.dilutionScore({ ticker, view: getFlag("--view") as any }))
     return
   }
@@ -1114,7 +1247,59 @@ async function main() {
     return
   }
 
+  if (group === "strategies" && command === "factor-rotation") {
+    print(await apiClient.strategyFactorRotation({
+      country: getFlag("--country"),
+      category: getFlag("--category"),
+      window: getFlag("--window"),
+      lookback: getFlag("--lookback"),
+      limit: getNumberFlag("--limit"),
+    }))
+    return
+  }
+
+  if (group === "strategies" && command === "regime-screen") {
+    print(await apiClient.strategyRegimeScreen({
+      country: getFlag("--country"),
+      category: getFlag("--category"),
+      window: getFlag("--window"),
+      lookback: getFlag("--lookback"),
+      limit: getNumberFlag("--limit"),
+    }))
+    return
+  }
+
   // --- Factor commands ---
+  if (group === "factors" && command === "history") {
+    const factorKey = getFlag("--factor") ?? getFlag("--factor-key") ?? getFlag("--key")
+    if (!factorKey) throw new Error("--factor, --factor-key, or --key is required")
+    const params = {
+      range: getFlag("--range"),
+      lookback: getFlag("--lookback"),
+      window: getFlag("--window"),
+      date_from: getFlag("--date-from") ?? getFlag("--date_from"),
+      date_to: getFlag("--date-to") ?? getFlag("--date_to"),
+      ...factorResponseParams(),
+    }
+    if (getFlag("--format") === "csv") printRaw(await apiClient.factorHistoryCsv(factorKey, params))
+    else print(await apiClient.factorHistory(factorKey, params))
+    return
+  }
+
+  if (group === "factors" && command === "sparklines") {
+    const params = {
+      ...factorKeySelectionParams(),
+      range: getFlag("--range"),
+      date_from: getFlag("--date-from") ?? getFlag("--date_from"),
+      date_to: getFlag("--date-to") ?? getFlag("--date_to"),
+      metric: getFlag("--metric") as any,
+      points: getNumberFlag("--points") ?? getNumberFlag("--point-limit") ?? getNumberFlag("--pointLimit") ?? getNumberFlag("--point_limit"),
+    }
+    if (getFlag("--format") === "csv") printRaw(await apiClient.factorSparklinesCsv(params))
+    else print(await apiClient.factorSparklines(params))
+    return
+  }
+
   if (group === "factors" && command === "returns-intraday") {
     print(await apiClient.factorReturnsIntraday({
       keys: getListFlag("--keys"),
@@ -1134,6 +1319,7 @@ async function main() {
       ticker: getFlag("--ticker"),
       portfolioId: getFlag("--portfolio-id"),
       keys: getListFlag("--keys"),
+      ...factorResponseParams(),
     }))
     return
   }
@@ -1144,6 +1330,115 @@ async function main() {
       window: getFlag("--window"),
       lookback: getFlag("--lookback"),
       limit: getNumberFlag("--limit"),
+    }))
+    return
+  }
+
+  if (group === "factors" && command === "extreme-moves") {
+    print(await apiClient.factorExtremeMoves({
+      keys: getListFlag("--keys"),
+      category: getFlag("--category"),
+      window: getFlag("--window"),
+      lookback: getFlag("--lookback"),
+      side: getFlag("--side") as any,
+      direction: getFlag("--direction") as any,
+      sort: getFlag("--sort") as any,
+      min_z_score: getNumberFlag("--min-z-score") ?? getNumberFlag("--min_z_score"),
+      minAbsZScore: getNumberFlag("--min-abs-z-score") ?? getNumberFlag("--minAbsZScore"),
+      limit: getNumberFlag("--limit"),
+      response_mode: getFlag("--response-mode") as any,
+      include: getListFlag("--include"),
+    }))
+    return
+  }
+
+  if (group === "factors" && command === "extreme-pairs") {
+    print(await apiClient.factorExtremePairs({
+      keys: getListFlag("--keys"),
+      category: getFlag("--category"),
+      window: getFlag("--window"),
+      lookback: getFlag("--lookback"),
+      side: getFlag("--side") as any,
+      direction: getFlag("--direction") as any,
+      sort: getFlag("--sort") as any,
+      min_z_score: getNumberFlag("--min-z-score") ?? getNumberFlag("--min_z_score"),
+      minAbsZScore: getNumberFlag("--min-abs-z-score") ?? getNumberFlag("--minAbsZScore"),
+      limit: getNumberFlag("--limit"),
+      response_mode: getFlag("--response-mode") as any,
+      include: getListFlag("--include"),
+    }))
+    return
+  }
+
+  if (group === "factors" && command === "valuations") {
+    const params = {
+      keys: getListFlag("--keys") ?? getListFlag("--factors"),
+      category: getFlag("--category"),
+      window: getFlag("--window"),
+      lookback: getFlag("--lookback"),
+      side: getFlag("--side") as any,
+      signal: getFlag("--signal") as any,
+      sort: getFlag("--sort") as any,
+      weighting_mode: getFlag("--weighting-mode") as any,
+      weighting: getFlag("--weighting") as any,
+      limit: getNumberFlag("--limit"),
+      response_mode: (getFlag("--response-mode") ?? getFlag("--view")) as any,
+      include: getListFlag("--include") ?? getListFlag("--expand"),
+    }
+    if (getFlag("--format") === "csv") printRaw(await apiClient.factorValuationsCsv(params))
+    else print(await apiClient.factorValuations(params))
+    return
+  }
+
+  if (group === "factors" && command === "valuation-stocks") {
+    const params = {
+      factor: getFlag("--factor"),
+      factorKey: getFlag("--factor-key") ?? getFlag("--factorKey"),
+      key: getFlag("--key"),
+      keys: getListFlag("--keys") ?? getListFlag("--factors"),
+      category: getFlag("--category"),
+      window: getFlag("--window"),
+      lookback: getFlag("--lookback"),
+      signal: getFlag("--signal") as any,
+      weighting_mode: getFlag("--weighting-mode") as any,
+      weighting: getFlag("--weighting") as any,
+      stance: getFlag("--stance") as any,
+      side: getFlag("--side") as any,
+      direction: getFlag("--direction") as any,
+      sort: getFlag("--sort") as any,
+      limit: getNumberFlag("--limit"),
+      response_mode: (getFlag("--response-mode") ?? getFlag("--view")) as any,
+      include: getListFlag("--include") ?? getListFlag("--expand"),
+    }
+    if (getFlag("--format") === "csv") printRaw(await apiClient.factorValuationStocksCsv(params))
+    else print(await apiClient.factorValuationStocks(params))
+    return
+  }
+
+  if (group === "factors" && command === "pairs") {
+    print(await apiClient.factorPairs({
+      factor1: getFlag("--factor1"),
+      factor2: getFlag("--factor2"),
+      f1: getFlag("--f1"),
+      f2: getFlag("--f2"),
+      window: getFlag("--window"),
+      lookback: getFlag("--lookback"),
+      response_mode: getFlag("--response-mode") as any,
+      include: getListFlag("--include"),
+    }))
+    return
+  }
+
+  if (group === "factors" && command === "pair-history") {
+    const f1 = getFlag("--factor1") ?? getFlag("--f1")
+    const f2 = getFlag("--factor2") ?? getFlag("--f2")
+    if (!f1 || !f2) throw new Error("--factor1/--f1 and --factor2/--f2 are required")
+    print(await apiClient.factorPairHistory(f1, f2, {
+      window: getFlag("--window"),
+      lookback: getFlag("--lookback"),
+      range: getFlag("--range"),
+      response_mode: getFlag("--response-mode") as any,
+      include: getListFlag("--include"),
     }))
     return
   }
@@ -1171,9 +1466,22 @@ async function main() {
     return
   }
 
+  if (group === "factors" && command === "similarity-pack") {
+    const symbol = getFlag("--ticker") ?? getFlag("--symbol")
+    if (!symbol) throw new Error("--ticker or --symbol is required")
+    print(await apiClient.factorSimilarityPack({
+      symbol,
+      candidates: getListFlag("--candidates"),
+      lookback: getFlag("--lookback"),
+      limit: getNumberFlag("--limit"),
+    }))
+    return
+  }
+
   if (group === "factors" && command === "catalog") {
     print(await apiClient.factorCatalog({
       category: getFlag("--category"),
+      ...factorResponseParams(),
     }))
     return
   }
@@ -1185,6 +1493,32 @@ async function main() {
       window: getFlag("--window"),
       lookback: getFlag("--lookback"),
     }))
+    return
+  }
+
+  if (group === "factors" && command === "exposures") {
+    const symbols = getListFlag("--symbols") ?? getListFlag("--tickers")
+    if (!symbols?.length) throw new Error("--symbols or --tickers is required")
+    print(await apiClient.factorExposures({
+      symbols,
+      ...factorKeySelectionParams(),
+      model: getFlag("--model") as any,
+    } as any))
+    return
+  }
+
+  if (group === "factors" && command === "bulk-download") {
+    const params = factorKeySelectionParams()
+    if (getFlag("--format") === "csv") printRaw(await apiClient.factorBulkDownloadCsv(params))
+    else print(await apiClient.factorBulkDownload(params))
+    return
+  }
+
+  if (group === "factors" && command === "custom") {
+    const body = getObjectInput("--body-json", "--body-file", "custom factor request")
+      ?? getObjectInput("--query-json", "--query-file", "custom factor request")
+    if (!body) throw new Error("--body-json, --body-file, --query-json, or --query-file is required")
+    print(await apiClient.factorCustom(body as any, factorResponseParams()))
     return
   }
 
@@ -1208,6 +1542,56 @@ async function main() {
     return
   }
 
+  // --- Portfolio factor workflow commands ---
+  if (group === "portfolio" && command === "analyze") {
+    print(await apiClient.portfolioAnalyze({
+      ...portfolioWorkflowBody(),
+      benchmarkLabel: getFlag("--benchmark-label"),
+      benchmarkHoldings: getArrayInput("--benchmark-holdings-json", "--benchmark-holdings-file", "benchmark holdings") as any,
+      whatIfLabel: getFlag("--what-if-label"),
+      whatIfHoldings: getArrayInput("--what-if-holdings-json", "--what-if-holdings-file", "what-if holdings") as any,
+    }, factorResponseParams()))
+    return
+  }
+
+  if (group === "portfolio" && command === "attribution") {
+    print(await apiClient.portfolioAttribution({
+      ...portfolioWorkflowBody(),
+      window: getFlag("--window"),
+      frequency: getFlag("--frequency") as any,
+      exportFormat: getFlag("--export-format") as any,
+    }, factorResponseParams()))
+    return
+  }
+
+  if (group === "portfolio" && command === "hedge") {
+    print(await apiClient.portfolioHedge({
+      ...portfolioWorkflowBody(),
+      objective: getFlag("--objective") as any,
+      mode: getFlag("--mode") as any,
+      constraints: getObjectInput("--constraints-json", "--constraints-file", "hedge constraints") as any,
+    }, factorResponseParams()))
+    return
+  }
+
+  if (group === "portfolio" && command === "optimize") {
+    print(await apiClient.portfolioOptimize({
+      ...portfolioWorkflowBody(),
+      objective: getFlag("--objective") as any,
+      maxHedges: getNumberFlag("--max-hedges") ?? getNumberFlag("--maxHedges"),
+      constraints: getObjectInput("--constraints-json", "--constraints-file", "optimizer constraints") as any,
+    }, factorResponseParams()))
+    return
+  }
+
+  if (group === "portfolio" && command === "stress-test") {
+    print(await apiClient.portfolioStressTest({
+      ...portfolioWorkflowBody(),
+      scenarioKey: getFlag("--scenario-key") as any,
+    }, factorResponseParams()))
+    return
+  }
+
   // --- Stocks commands ---
   if (group === "stocks" && command === "loadings") {
     const ticker = getFlag("--ticker")
@@ -1228,7 +1612,35 @@ async function main() {
       keys: getListFlag("--keys"),
       category: getFlag("--category"),
       lookback: getFlag("--lookback"),
+      ...factorResponseParams(),
     }))
+    return
+  }
+
+  // --- Model factor workflow commands ---
+  if (group === "models" && command === "factor-analysis") {
+    const model = getObjectInput("--model-json", "--model-file", "model") ?? {
+      id: getFlag("--model-id"),
+      label: getFlag("--label"),
+      source: getFlag("--source"),
+    }
+    print(await apiClient.modelFactorAnalysis({
+      model: model as any,
+      country: getFlag("--country"),
+      lookback: getFlag("--lookback"),
+      window: getFlag("--window"),
+      category: getFlag("--category"),
+      keys: getListFlag("--keys") ?? getListFlag("--factors"),
+      include: {
+        attribution: getBooleanFlag("--include-attribution"),
+        hedge: getBooleanFlag("--include-hedge"),
+        optimizer: getBooleanFlag("--include-optimizer"),
+        positionViews: getBooleanFlag("--include-position-views"),
+      },
+      hedge: getObjectInput("--hedge-json", "--hedge-file", "hedge options") as any,
+      optimizer: getObjectInput("--optimizer-json", "--optimizer-file", "optimizer options") as any,
+      holdings: getRequiredHoldings(),
+    }, factorResponseParams()))
     return
   }
 
@@ -1356,145 +1768,170 @@ async function main() {
     "Compatibility alias: omni-sec",
     "",
     "Commands:",
-    "  omni-sec health",
-    "  omni-sec me",
-    "  omni-sec org show",
-    "  omni-sec billing show",
-    "  omni-sec dashboard overview",
-    "  omni-sec billing quote --meter-class section_extract --units 10",
-    "  omni-sec billing budget --spend-cap-cents 900 --soft-cap-cents 500 --approval-threshold-cents 750",
-    "  omni-sec billing checkout --plan personal",
-    "  omni-sec billing portal",
-    "  omni-sec agent bootstrap-token --label ci --scopes read:sec --ttl-seconds 900",
-    "  omni-sec agent bootstrap --token agbt_... --label first-agent-key",
+    "  secapi health",
+    "  secapi me",
+    "  secapi org show",
+    "  secapi billing show",
+    "  secapi dashboard overview",
+    "  secapi billing quote --meter-class section_extract --units 10",
+    "  secapi billing budget --spend-cap-cents 900 --soft-cap-cents 500 --approval-threshold-cents 750",
+    "  secapi billing checkout --plan personal",
+    "  secapi billing portal",
+    "  secapi agent bootstrap-token --label ci --scopes read:sec --ttl-seconds 900",
+    "  secapi agent bootstrap --token agbt_... --label first-agent-key",
     "",
     "  # Agent prompt library",
-    "  omni-sec agents personas",
-    "  omni-sec agents prompts list",
-    "  omni-sec agents prompts list --persona law-firm",
-    "  omni-sec agents prompts list --persona investment-manager --json",
-    "  omni-sec agents prompts list --include-v2",
-    "  omni-sec agents prompts read law-firm-enforcement-history",
-    "  omni-sec agents prompts copy investment-manager-factor-decomposition | pbcopy",
-    "  omni-sec api-keys list",
-    "  SECAPI_API_KEY=... omni-sec api-keys list",
-    "  SECAPI_OPERATOR_API_KEY=... omni-sec admin orgs --limit 20",
-    "  OMNI_DATASTREAM_API_KEY=... omni-sec api-keys list  # legacy env fallback",
-    `  printf '%s' \"$SECAPI_API_KEY\" | omni-sec api-keys list ${STDIN_FLAG_NAME}`,
-    "  omni-sec usage show",
-    "  omni-sec limits show",
-    "  omni-sec events list --kind event --limit 10",
-    "  omni-sec events export --kind webhook_delivery --format json",
-    "  omni-sec diagnostics request --request-id req_...",
-    "  omni-sec diagnostics deliveries-summary --limit 50",
-    "  omni-sec admin orgs --limit 20",
-    "  omni-sec admin org --org-id org_...",
-    "  omni-sec admin request --org-id org_... --request-id req_...",
-    "  omni-sec admin deliveries-summary --org-id org_... --limit 20",
-    "  omni-sec observability show",
-    "  omni-sec observability export --limit 20",
-    "  omni-sec api-keys create --label local-dev --scopes read:sec,write:artifacts",
-    "  omni-sec webhooks list",
-    "  omni-sec webhooks create --destination-url https://example.com/hooks/sec --event-types artifact.created,artifact.reconciled",
-    "  omni-sec webhooks rotate-secret --webhook-id wh_...",
-    "  omni-sec webhooks deliveries --webhook-id wh_... --limit 10",
-    "  omni-sec webhooks replay-delivery --webhook-id wh_... --delivery-id wdel_...",
-    "  omni-sec streams list",
-    "  omni-sec streams create --event-types artifact.created,artifact.reconciled --transport poll",
-    "  omni-sec streams events --stream-id strm_... --limit 10",
-    "  omni-sec entities resolve --ticker AAPL",
-    "  omni-sec filings search --ticker AAPL --form 10-K",
-    "  omni-sec filings search --q risk factors --form 10-K",
-    "  omni-sec filings latest --ticker AAPL --form 10-K",
-    "  omni-sec filings render --ticker AAPL --form 10-K",
-    "  omni-sec sections search --ticker AAPL --q risk --form 10-K",
-    "  omni-sec sections get --ticker AAPL --form 10-K --section item_1a",
-    "  omni-sec facts get --ticker AAPL --tag Assets --form 10-K",
-    "  omni-sec statements get --ticker AAPL --statement balance_sheet --period annual",
-    "  omni-sec owners 13f --cik 0001067983 --limit 25 [--view agent]",
-    "  omni-sec owners compare-13f --cik 0001067983 --limit 25",
-    "  omni-sec insiders list --ticker AAPL --limit 10 [--view agent]",
-    "  omni-sec compensation list --ticker AAPL --limit 10 [--view agent]",
-    "  omni-sec compensation compare --ticker AAPL --limit 10",
+    "  secapi agents personas",
+    "  secapi agents prompts list",
+    "  secapi agents prompts list --persona law-firm",
+    "  secapi agents prompts list --persona investment-manager --json",
+    "  secapi agents prompts list --include-v2",
+    "  secapi agents prompts read law-firm-enforcement-history",
+    "  secapi agents prompts copy investment-manager-factor-decomposition | pbcopy",
+    "  secapi api-keys list",
+    "  SECAPI_API_KEY=... secapi api-keys list",
+    "  SECAPI_OPERATOR_API_KEY=... secapi admin orgs --limit 20",
+    "  OMNI_DATASTREAM_API_KEY=... omni-sec api-keys list  # compatibility env + binary alias",
+    `  printf '%s' \"$SECAPI_API_KEY\" | secapi api-keys list ${STDIN_FLAG_NAME}`,
+    "  secapi usage show",
+    "  secapi limits show",
+    "  secapi events list --kind event --limit 10",
+    "  secapi events export --kind webhook_delivery --format json",
+    "  secapi diagnostics request --request-id req_...",
+    "  secapi diagnostics deliveries-summary --limit 50",
+    "  secapi admin orgs --limit 20",
+    "  secapi admin org --org-id org_...",
+    "  secapi admin request --org-id org_... --request-id req_...",
+    "  secapi admin deliveries-summary --org-id org_... --limit 20",
+    "  secapi observability show",
+    "  secapi observability export --limit 20",
+    "  secapi api-keys create --label local-dev --scopes read:sec,write:artifacts",
+    "  secapi webhooks list",
+    "  secapi webhooks create --destination-url https://example.com/hooks/sec --event-types artifact.created,artifact.reconciled",
+    "  secapi webhooks rotate-secret --webhook-id wh_...",
+    "  secapi webhooks deliveries --webhook-id wh_... --limit 10",
+    "  secapi webhooks replay-delivery --webhook-id wh_... --delivery-id wdel_...",
+    "  secapi streams list",
+    "  secapi streams create --event-types artifact.created,artifact.reconciled --transport poll",
+    "  secapi streams events --stream-id strm_... --limit 10",
+    "  secapi entities resolve --ticker AAPL",
+    "  secapi filings search --ticker AAPL --form 10-K",
+    "  secapi filings search --q risk factors --form 10-K",
+    "  secapi filings latest --ticker AAPL --form 10-K",
+    "  secapi filings render --ticker AAPL --form 10-K",
+    "  secapi sections search --ticker AAPL --q risk --form 10-K",
+    "  secapi sections get --ticker AAPL --form 10-K --section item_1a",
+    "  secapi search fulltext --q \"supply chain\" --form 10-K --limit 10",
+    "  secapi search semantic --q \"revenue concentration risk\" --ticker AAPL --mode hybrid [--view agent]",
+    "  secapi facts get --ticker AAPL --tag Assets --form 10-K",
+    "  secapi statements get --ticker AAPL --statement balance_sheet --period annual",
+    "  secapi owners 13f --cik 0001067983 --limit 25 [--view agent]",
+    "  secapi owners compare-13f --cik 0001067983 --limit 25",
+    "  secapi insiders list --ticker AAPL --limit 10 [--view agent]",
+    "  secapi compensation list --ticker AAPL --limit 10 [--view agent]",
+    "  secapi compensation compare --ticker AAPL --limit 10",
     "",
     "  # Agent-mode endpoints (add --view agent for compact shape)",
-    "  omni-sec forms 144 --ticker AAPL --limit 10 [--view agent]",
-    "  omni-sec offerings list --ticker NVDA --limit 10 [--view agent]",
-    "  omni-sec events ma --ticker MSFT --limit 10 [--view agent]",
-    "  omni-sec events enforcement --query fraud --limit 10 [--view agent]",
-    "  omni-sec events voting-results --ticker MSFT --limit 10 [--view agent]",
-    "  omni-sec funds nport-holdings --ticker VTI --limit 25 [--view agent]",
-    "  omni-sec companies subsidiaries --ticker AAPL [--view agent]",
+    "  secapi forms 144 --ticker AAPL --limit 10 [--view agent]",
+    "  secapi offerings list --ticker NVDA --limit 10 [--view agent]",
+    "  secapi events ma --ticker MSFT --limit 10 [--view agent]",
+    "  secapi events enforcement --query fraud --limit 10 [--view agent]",
+    "  secapi events voting-results --ticker MSFT --limit 10 [--view agent]",
+    "  secapi funds nport-holdings --ticker VTI --limit 25 [--view agent]",
+    "  secapi companies subsidiaries --ticker AAPL [--view agent]",
     "",
     "  # Dilution endpoints — all support --view agent except `coverage`",
-    "  omni-sec dilution events --ticker BBBB --is-atm true --limit 10 [--view agent]",
-    "  omni-sec dilution event --event-id evt_... [--view agent]",
-    "  omni-sec dilution warrants --ticker BBBB --limit 10 [--view agent]",
-    "  omni-sec dilution convertibles --ticker BBBB --limit 10 [--view agent]",
-    "  omni-sec dilution rofr --ticker BBBB --limit 10 [--view agent]",
-    "  omni-sec dilution lockups --ticker BBBB --limit 10 [--view agent]",
-    "  omni-sec dilution cash-position --ticker BBBB --limit 5 [--view agent]",
-    "  omni-sec dilution corporate-actions --ticker BBBB --action-type reverse_split [--view agent]",
-    "  omni-sec dilution nasdaq-compliance --status active --limit 10 [--view agent]",
-    "  omni-sec dilution ratings --overall-risk high --limit 10 [--view agent]",
-    "  omni-sec dilution reverse-splits --ticker BBBB --limit 5 [--view agent]",
-    "  omni-sec dilution score --ticker BBBB [--view agent]",
-    "  omni-sec dilution share-float-history --ticker BBBB --limit 12 [--view agent]",
-    "  omni-sec dilution coverage [--ticker BBBB]",
-    "  omni-sec artifacts bundle --ticker AAPL --form 10-K --section item_1a",
-    "  omni-sec artifacts list --kind markdown_bundle --limit 10",
-    "  omni-sec artifacts summary",
-    "  omni-sec artifacts manifest --artifact-id art_...",
-    "  omni-sec artifacts export --artifact-id art_... --format json",
-    "  omni-sec artifacts reconcile --artifact-id art_...",
+    "  secapi dilution events --ticker BBBB --is-atm true --limit 10 [--view agent]",
+    "  secapi dilution event --event-id evt_... [--view agent]",
+    "  secapi dilution warrants --ticker BBBB --limit 10 [--view agent]",
+    "  secapi dilution convertibles --ticker BBBB --limit 10 [--view agent]",
+    "  secapi dilution rofr --ticker BBBB --limit 10 [--view agent]",
+    "  secapi dilution lockups --ticker BBBB --limit 10 [--view agent]",
+    "  secapi dilution cash-position --ticker BBBB --limit 5 [--view agent]",
+    "  secapi dilution corporate-actions --ticker BBBB --action-type reverse_split [--view agent]",
+    "  secapi dilution nasdaq-compliance --status active --limit 10 [--view agent]",
+    "  secapi dilution ratings --overall-risk high --limit 10 [--view agent]",
+    "  secapi dilution reverse-splits --ticker BBBB --limit 5 [--view agent]",
+    "  secapi dilution score --ticker BBBB [--view agent]",
+    "  secapi dilution share-float-history --ticker BBBB --limit 12 [--view agent]",
+    "  secapi dilution coverage [--ticker BBBB]",
+    "  secapi artifacts bundle --ticker AAPL --form 10-K --section item_1a",
+    "  secapi artifacts list --kind markdown_bundle --limit 10",
+    "  secapi artifacts summary",
+    "  secapi artifacts manifest --artifact-id art_...",
+    "  secapi artifacts export --artifact-id art_... --format json",
+    "  secapi artifacts reconcile --artifact-id art_...",
     "",
     "  # Macro",
-    "  omni-sec macro high-signal-pack --country JP",
-    "  omni-sec macro regimes --country US --lookback 18m",
-    "  omni-sec macro indicators --country US --indicator GDP",
-    "  omni-sec macro releases --country US",
-    "  omni-sec macro calendar --country US --days 30",
-    "  omni-sec macro forecasts --country US",
+    "  secapi macro high-signal-pack --country JP",
+    "  secapi macro regimes --country US --lookback 18m",
+    "  secapi macro indicators --country US --indicator GDP",
+    "  secapi macro releases --country US",
+    "  secapi macro calendar --country US --days 30",
+    "  secapi macro forecasts --country US",
     "",
     "  # Factors",
-    "  omni-sec factors catalog --category style",
-    "  omni-sec factors returns --keys MOMENTUM,VALUE --window 1m",
-    "  omni-sec factors returns-intraday --window 1m",
-    "  omni-sec factors dashboard --country US --category style --ticker AAPL",
-    "  omni-sec factors screen --category style --limit 10",
-    "  omni-sec factors decomposition --ticker AAPL",
-    "  omni-sec factors related-stocks --ticker AAPL --limit 10",
-    "  omni-sec factors correlations --keys MOMENTUM,VALUE",
-    "  omni-sec factors regime-performance --country US",
+    "  secapi factors catalog --category style",
+    "  secapi factors returns --keys MOMENTUM,VALUE --window 1m",
+    "  secapi factors history --factor VALUE --range 1y --include trust,series",
+    "  secapi factors sparklines --keys MOMENTUM,VALUE --range 1y --points 64",
+    "  secapi factors returns-intraday --window 1m",
+    "  secapi factors dashboard --country US --category style --ticker AAPL",
+    "  secapi factors screen --category style --limit 10",
+    "  secapi factors extreme-moves --category style --window 1d --min-z-score 2 --limit 10",
+    "  secapi factors extreme-pairs --category style --window 1m --min-z-score 1 --limit 10",
+    "  secapi factors valuations --category style --signal tailwind --sort opportunity_score --limit 10",
+    "  secapi factors valuation-stocks --factor VALUE --stance beneficiaries --limit 25",
+    "  secapi factors pairs --factor1 VALUE --factor2 MOMENTUM --window 1m",
+    "  secapi factors pair-history --factor1 VALUE --factor2 MOMENTUM --include series",
+    "  secapi factors decomposition --ticker AAPL",
+    "  secapi factors related-stocks --ticker AAPL --limit 10",
+    "  secapi factors similarity-pack --ticker AAPL --limit 10",
+    "  secapi factors exposures --symbols AAPL,MSFT --keys QUALITY,MOMENTUM",
+    "  secapi factors bulk-download --keys VALUE,MOMENTUM --format csv",
+    "  secapi factors custom --body-json '{\"symbol\":\"AAPL\",\"candidates\":[\"MSFT\"]}'",
+    "  secapi factors correlations --keys MOMENTUM,VALUE",
+    "  secapi factors regime-performance --country US",
+    "",
+    "  # Portfolio factor workflows",
+    "  secapi portfolio analyze --holdings-json '[{\"symbol\":\"AAPL\",\"weight\":0.6},{\"symbol\":\"MSFT\",\"weight\":0.4}]'",
+    "  secapi portfolio attribution --holdings-file holdings.json --window 1m --frequency weekly",
+    "  secapi portfolio hedge --holdings-file holdings.json --objective min_drawdown --constraints-json '{\"maxHedges\":2}'",
+    "  secapi portfolio optimize --holdings-file holdings.json --objective regime_aware --constraints-json '{\"maxCandidates\":3}'",
+    "  secapi portfolio stress-test --holdings-file holdings.json --scenario-key higher_for_longer",
+    "",
+    "  # Factor strategies",
+    "  secapi strategies factor-rotation --country US --category style --limit 5",
+    "  secapi strategies regime-screen --country US --lookback 6m",
     "",
     "  # Stocks",
-    "  omni-sec stocks loadings --ticker AAPL",
+    "  secapi stocks loadings --ticker AAPL",
     "",
     "  # Model Portfolios",
-    "  omni-sec model-portfolios factor-view --portfolio-id us_megacap_platforms",
+    "  secapi model-portfolios factor-view --portfolio-id us_megacap_platforms",
+    "  secapi models factor-analysis --holdings-file holdings.json --label 'AI leaders' --include-optimizer true",
     "",
     "  # Intelligence",
-    "  omni-sec intelligence security --ticker AAPL",
-    "  omni-sec intelligence company --ticker AAPL",
-    "  omni-sec intelligence earnings-preview --ticker AAPL",
-    "  omni-sec intelligence footnotes-query --ticker AAPL --topics lease,debt_covenant",
+    "  secapi intelligence security --ticker AAPL",
+    "  secapi intelligence company --ticker AAPL",
+    "  secapi intelligence earnings-preview --ticker AAPL",
+    "  secapi intelligence footnotes-query --ticker AAPL --topics lease,debt_covenant",
     "",
     "  # Companies (canonical financials)",
-    "  omni-sec companies financials --ticker AAPL --period annual",
-    "  omni-sec companies ratios --ticker AAPL --period annual",
-    "  omni-sec companies income-statements --ticker AAPL",
-    "  omni-sec companies balance-sheets --ticker AAPL",
-    "  omni-sec companies cash-flow-statements --ticker AAPL",
-    "  omni-sec companies resolve --ticker AAPL",
-    "  omni-sec companies resolve --figi BBG000B9XRY4",
-    "  omni-sec companies search --q Apple --limit 5",
+    "  secapi companies financials --ticker AAPL --period annual",
+    "  secapi companies ratios --ticker AAPL --period annual",
+    "  secapi companies income-statements --ticker AAPL",
+    "  secapi companies balance-sheets --ticker AAPL",
+    "  secapi companies cash-flow-statements --ticker AAPL",
+    "  secapi companies resolve --ticker AAPL",
+    "  secapi companies resolve --figi BBG000B9XRY4",
+    "  secapi companies search --q Apple --limit 5",
     "",
     "Environment:",
     "  Preferred: SECAPI_API_KEY, SECAPI_BEARER_TOKEN, SECAPI_BASE_URL, SECAPI_API_BASE_URL, SECAPI_OPERATOR_API_KEY",
-    "  Compatibility fallbacks: OMNI_DATASTREAM_API_KEY, OMNI_DATASTREAM_BEARER_TOKEN, OMNI_DATASTREAM_BASE_URL, OMNI_OPERATOR_API_KEY, OMNI_DATASTREAM_OPERATOR_API_KEY",
   ]
   console.log(commandHelpLines.map((line) => (
-    line === "Compatibility alias: omni-sec" ? line : line.replace(/\bomni-sec\b/g, "secapi")
+    line
   )).join("\n"))
 }
 
