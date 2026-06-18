@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
 import {
   AGENT_PROMPT_LIBRARY,
   AGENT_PROMPT_PERSONAS,
@@ -1762,6 +1764,144 @@ async function main() {
     return
   }
 
+  // --- One-command MCP install (OMNI-4443) ---
+  // `secapi init --client <name>` writes the hosted-MCP config for an agent
+  // client. The API key is read from SECAPI_API_KEY / --api-key-stdin (never an
+  // argv flag — see rejectCredentialArgvFlags); a placeholder is used otherwise.
+  if (group === "init" || (group === "agents" && command === "setup")) {
+    const mcpUrl = `${baseUrl.replace(/\/+$/, "")}/mcp`
+    // init's literal key comes ONLY from the documented SECAPI_API_KEY (or
+    // --api-key-stdin) — never the operator-key chain that resolveCredentials
+    // prefers, so init never persists an operator key into a client config.
+    const initKeySource = hasFlag(STDIN_FLAG_NAME) ? credentials.apiKey : envCredential("SECAPI_API_KEY")
+    const literalKey = initKeySource ?? "YOUR_API_KEY"
+    const hasRealKey = Boolean(initKeySource)
+    const dryRun = hasFlag("--print") || hasFlag("--dry-run")
+    const positional = group === "init" && command && !command.startsWith("-") ? command : undefined
+    const clientFlag = getFlag("--client")
+    // A `-`-prefixed value means the client name was omitted (e.g. `--client --print`).
+    const requested = clientFlag && !clientFlag.startsWith("-") ? clientFlag : positional
+
+    const claudeDesktopPath = () => {
+      const home = homedir()
+      if (process.platform === "darwin") return join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+      if (process.platform === "win32") return join(process.env.APPDATA ?? join(home, "AppData", "Roaming"), "Claude", "claude_desktop_config.json")
+      return join(home, ".config", "Claude", "claude_desktop_config.json")
+    }
+    // keyValue: project-scoped (committable) files get an env-var REFERENCE so a
+    // live key is never written to a file that lands in source control; global,
+    // owner-only files get the literal key for convenience.
+    type FileSpec = { kind: "file"; urlKey: "url" | "serverUrl"; httpType: boolean; keyValue: string; committable: boolean; path: () => string }
+    const clients: Record<string, { kind: "command" } | FileSpec> = {
+      "claude-code": { kind: "command" },
+      "claude-desktop": { kind: "file", urlKey: "url", httpType: true, keyValue: literalKey, committable: false, path: claudeDesktopPath },
+      cursor: { kind: "file", urlKey: "url", httpType: false, keyValue: "${SECAPI_API_KEY}", committable: true, path: () => join(process.cwd(), ".cursor", "mcp.json") },
+      windsurf: { kind: "file", urlKey: "serverUrl", httpType: false, keyValue: "${env:SECAPI_API_KEY}", committable: false, path: () => join(homedir(), ".codeium", "windsurf", "mcp_config.json") },
+      project: { kind: "file", urlKey: "url", httpType: true, keyValue: "${SECAPI_API_KEY}", committable: true, path: () => join(process.cwd(), ".mcp.json") },
+    }
+    const names = Object.keys(clients).join(", ")
+
+    if (!requested) {
+      process.stdout.write(`Usage: secapi init --client <${names}> [--print]\n\nWrites the SEC API hosted-MCP config (${mcpUrl}, x-api-key) for your agent client.\nProvide your API key via SECAPI_API_KEY (or ${STDIN_FLAG_NAME}); it is never read from an argv flag.\n`)
+      return
+    }
+    const spec = clients[requested]
+    if (!spec) throw new Error(`Unknown client '${requested}'. Supported: ${names}`)
+
+    if (spec.kind === "command") {
+      // Use $SECAPI_API_KEY (shell-expanded at run time) so no literal key is printed.
+      process.stdout.write(`Add SEC API to Claude Code:\n\n  claude mcp add --transport http secapi ${mcpUrl} --header "x-api-key: \$SECAPI_API_KEY"\n`)
+      if (!hasRealKey) process.stdout.write(`\nSet SECAPI_API_KEY in your environment first.\n`)
+      return
+    }
+
+    const filePath = spec.path()
+    let config: Record<string, unknown> = {}
+    if (existsSync(filePath)) {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(readFileSync(filePath, "utf8"))
+      } catch {
+        throw new Error(`Existing config at ${filePath} is not valid JSON; fix or move it before running init.`)
+      }
+      if (Array.isArray(parsed) || typeof parsed !== "object" || parsed === null) {
+        throw new Error(`Existing config at ${filePath} is not a JSON object; fix or move it before running init.`)
+      }
+      config = parsed as Record<string, unknown>
+    }
+    const existingServers = config.mcpServers
+    if (existingServers !== undefined && (typeof existingServers !== "object" || existingServers === null || Array.isArray(existingServers))) {
+      throw new Error(`Existing "mcpServers" in ${filePath} is not an object; fix or move it before running init.`)
+    }
+    const servers: Record<string, unknown> = existingServers ? existingServers as Record<string, unknown> : {}
+    servers.secapi = {
+      ...(spec.httpType ? { type: "http" } : {}),
+      [spec.urlKey]: mcpUrl,
+      headers: { "x-api-key": spec.keyValue },
+    }
+    config.mcpServers = servers
+    const rendered = `${JSON.stringify(config, null, 2)}\n`
+
+    if (dryRun) {
+      process.stdout.write(`# ${filePath}\n${rendered}`)
+      return
+    }
+    mkdirSync(dirname(filePath), { recursive: true })
+    writeFileSync(filePath, rendered, { mode: 0o600 })
+    // chmod after write: writeFileSync's mode only applies on CREATE, so an
+    // already-existing config would otherwise keep its prior (looser) perms.
+    chmodSync(filePath, 0o600)
+    process.stdout.write(`Wrote SEC API MCP config for ${requested} to ${filePath}\n`)
+    if (spec.keyValue.startsWith("$")) {
+      process.stdout.write(`Set SECAPI_API_KEY in your environment so ${requested} can resolve the key.\n`)
+    } else if (!hasRealKey) {
+      process.stdout.write(`Replace YOUR_API_KEY in that file with your key (or set SECAPI_API_KEY and re-run).\n`)
+    }
+    if (spec.committable) {
+      process.stdout.write(`Note: ${filePath} can be committed — it uses an env-var reference, not your literal key.\n`)
+    }
+    process.stdout.write(`Restart ${requested} to load the server.\n`)
+    return
+  }
+
+  // `secapi agent-context` — machine-readable description of the CLI surface so
+  // an agent can learn the whole tool in one call.
+  if (group === "agent-context" || (group === "agents" && command === "context")) {
+    print({
+      object: "agent_context",
+      cli: { binaries: ["secapi", "omni-sec"], version: cliVersion() },
+      baseUrl,
+      mcpUrl: `${baseUrl.replace(/\/+$/, "")}/mcp`,
+      docs: "https://docs.secapi.ai",
+      agentsPage: "https://secapi.ai/agents",
+      auth: {
+        header: "x-api-key",
+        note: "Authenticate with the x-api-key header. Never send the API key as Authorization: Bearer.",
+        envVars: ["SECAPI_API_KEY", "SECAPI_OPERATOR_API_KEY", "SECAPI_BEARER_TOKEN (WorkOS bearer, not an API key)"],
+        stdin: [STDIN_FLAG_NAME, STDIN_BEARER_FLAG_NAME],
+      },
+      install: {
+        mcp: `secapi init --client <claude-code|claude-desktop|cursor|windsurf|project>`,
+        skills: "npx skills add secapi-ai/secapi-skills --global",
+      },
+      commandGroups: [
+        { group: "account", commands: ["health", "me", "org show", "billing show", "usage show", "limits show", "api-keys list", "api-keys create --label <l> --scopes <s>"] },
+        { group: "agent", commands: ["agent bootstrap-token --label <l> --scopes <s> --ttl-seconds <n>", "agent bootstrap --token <agbt_...>"] },
+        { group: "agents", commands: ["agents personas", "agents prompts list [--persona <p>] [--include-v2] [--json]", "agents prompts read <id>", "agents prompts copy <id>", "agents setup --client <name>", "agents context"] },
+        { group: "entities", commands: ["entities resolve --ticker <t> | --name <n> | --cik <c>"] },
+        { group: "filings", commands: ["filings search --ticker <t> --form <f>", "filings latest --ticker <t> --form <f>", "sections get --ticker <t> --form 10-K --section item_1a"] },
+        { group: "factors", commands: ["factors exposures --symbols <list>", "factors decomposition --symbol <t>", "factors screen --keys <list>", "factors valuations --keys <list>"] },
+        { group: "setup", commands: ["init --client <claude-code|claude-desktop|cursor|windsurf|project> [--print]", "agent-context"] },
+      ],
+      conventions: {
+        output: "JSON to stdout by default; human-readable when stdout is a TTY for agents/personas commands.",
+        correlation: "Request-Id header on every response.",
+        guardrails: "Check GET /v1/billing and POST /v1/billing/quote before expensive or repeated workflows.",
+      },
+    })
+    return
+  }
+
   const commandHelpLines = [
     "SEC API CLI",
     "Preferred binary: secapi",
@@ -1779,6 +1919,12 @@ async function main() {
     "  secapi billing portal",
     "  secapi agent bootstrap-token --label ci --scopes read:sec --ttl-seconds 900",
     "  secapi agent bootstrap --token agbt_... --label first-agent-key",
+    "",
+    "  # Connect an agent (one-command MCP install)",
+    "  secapi init --client claude-code        # prints the `claude mcp add` command",
+    "  secapi init --client cursor             # writes .cursor/mcp.json",
+    "  secapi init --client claude-desktop --print   # dry-run the config",
+    "  secapi agent-context                    # machine-readable CLI surface for agents",
     "",
     "  # Agent prompt library",
     "  secapi agents personas",

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { spawn } from "node:child_process"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
@@ -952,5 +952,147 @@ describe("CLI portfolio and model factor commands", () => {
     expect(requests[0]?.path).toBe("/v1/strategies/regime-screen")
     expect(JSON.parse(requests[0]?.body ?? "{}").lookback).toBe("6m")
     assertNoSecretLeak(rotation.stdout + regime.stdout, rotation.stderr + regime.stderr)
+  })
+})
+
+describe("CLI agent setup (init + agent-context)", () => {
+  test("agent-context emits machine-readable JSON describing the CLI surface", async () => {
+    const result = await runCli(["agent-context"])
+    expect(result.status).toBe(0)
+    const ctx = JSON.parse(result.stdout)
+    expect(ctx.object).toBe("agent_context")
+    expect(ctx.mcpUrl).toContain("/mcp")
+    expect(ctx.auth.header).toBe("x-api-key")
+    expect(ctx.install.skills).toContain("npx skills add secapi-ai/secapi-skills")
+    expect(Array.isArray(ctx.commandGroups)).toBe(true)
+  })
+
+  test("init --client claude-code prints the command with a shell env reference, not a literal key", async () => {
+    const result = await runCli(["init", "--client", "claude-code"], { env: { SECAPI_API_KEY: "ods_live_INIT_KEY" } })
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain("claude mcp add --transport http secapi")
+    expect(result.stdout).toContain("/mcp")
+    expect(result.stdout).toContain("x-api-key: $SECAPI_API_KEY")
+    expect(result.stdout).not.toContain("ods_live_INIT_KEY")
+  })
+
+  test("init --client cursor uses an env-var reference (no literal key in a committable file)", async () => {
+    const result = await runCli(["init", "--client", "cursor", "--print"], { env: { SECAPI_API_KEY: "ods_live_INIT_KEY" } })
+    expect(result.status).toBe(0)
+    const json = JSON.parse(result.stdout.split("\n").slice(1).join("\n"))
+    expect(json.mcpServers.secapi.url).toContain("/mcp")
+    expect(json.mcpServers.secapi.headers["x-api-key"]).toBe("${SECAPI_API_KEY}")
+    expect(result.stdout).not.toContain("ods_live_INIT_KEY")
+  })
+
+  test("init --client project adds type:http and an env-var reference", async () => {
+    const result = await runCli(["init", "--client", "project", "--print"], { env: { SECAPI_API_KEY: "ods_live_INIT_KEY" } })
+    expect(result.status).toBe(0)
+    const json = JSON.parse(result.stdout.split("\n").slice(1).join("\n"))
+    expect(json.mcpServers.secapi.type).toBe("http")
+    expect(json.mcpServers.secapi.headers["x-api-key"]).toBe("${SECAPI_API_KEY}")
+  })
+
+  test("init --client windsurf writes a merged MCP config into HOME (env ref, 0600)", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "secapi-init-"))
+    try {
+      const result = await runCli(["init", "--client", "windsurf"], { env: { HOME: home, SECAPI_API_KEY: "ods_live_INIT_KEY" } })
+      expect(result.status).toBe(0)
+      const configPath = path.join(home, ".codeium", "windsurf", "mcp_config.json")
+      const raw = readFileSync(configPath, "utf8")
+      expect(raw).not.toContain("ods_live_INIT_KEY")
+      const written = JSON.parse(raw)
+      expect(written.mcpServers.secapi.serverUrl).toContain("/mcp")
+      expect(written.mcpServers.secapi.headers["x-api-key"]).toBe("${env:SECAPI_API_KEY}")
+      if (process.platform !== "win32") {
+        const { statSync } = await import("node:fs")
+        expect(statSync(configPath).mode & 0o777).toBe(0o600)
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  test("init rejects an existing config whose mcpServers is an array", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "secapi-init-"))
+    try {
+      const configPath = path.join(home, ".codeium", "windsurf", "mcp_config.json")
+      const { mkdirSync } = await import("node:fs")
+      mkdirSync(path.dirname(configPath), { recursive: true })
+      writeFileSync(configPath, JSON.stringify({ mcpServers: ["nope"] }))
+      const result = await runCli(["init", "--client", "windsurf"], { env: { HOME: home, SECAPI_API_KEY: "ods_live_INIT_KEY" } })
+      expect(result.status).toBe(1)
+      expect(result.stderr).toContain("is not an object")
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  test("init treats --client followed by a flag as a missing client", async () => {
+    const result = await runCli(["init", "--client", "--print"])
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain("Usage: secapi init --client")
+  })
+
+  test("init never persists an operator key (only SECAPI_API_KEY/stdin)", async () => {
+    const result = await runCli(["init", "--client", "claude-desktop", "--print"], {
+      env: { SECAPI_OPERATOR_API_KEY: "opr_live_OPERATOR_AUTH" },
+    })
+    expect(result.status).toBe(0)
+    expect(result.stdout).not.toContain("opr_live_OPERATOR_AUTH")
+    expect(result.stdout).toContain("YOUR_API_KEY")
+    assertNoSecretLeak(result.stdout, result.stderr)
+  })
+
+  test("init tightens permissions on an already-existing config", async () => {
+    if (process.platform === "win32") return
+    const home = mkdtempSync(path.join(tmpdir(), "secapi-init-"))
+    try {
+      const configPath = path.join(home, ".codeium", "windsurf", "mcp_config.json")
+      const { mkdirSync, statSync, chmodSync } = await import("node:fs")
+      mkdirSync(path.dirname(configPath), { recursive: true })
+      writeFileSync(configPath, JSON.stringify({ mcpServers: {} }))
+      chmodSync(configPath, 0o644)
+      const result = await runCli(["init", "--client", "windsurf"], { env: { HOME: home, SECAPI_API_KEY: "ods_live_INIT_KEY" } })
+      expect(result.status).toBe(0)
+      expect(statSync(configPath).mode & 0o777).toBe(0o600)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  test("init preserves existing servers when merging", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "secapi-init-"))
+    try {
+      const configPath = path.join(home, ".codeium", "windsurf", "mcp_config.json")
+      const { mkdirSync } = await import("node:fs")
+      mkdirSync(path.dirname(configPath), { recursive: true })
+      writeFileSync(configPath, JSON.stringify({ mcpServers: { other: { serverUrl: "https://example.com" } } }, null, 2))
+      const result = await runCli(["init", "--client", "windsurf"], { env: { HOME: home, SECAPI_API_KEY: "ods_live_INIT_KEY" } })
+      expect(result.status).toBe(0)
+      const written = JSON.parse(readFileSync(configPath, "utf8"))
+      expect(written.mcpServers.other.serverUrl).toBe("https://example.com")
+      expect(written.mcpServers.secapi.serverUrl).toContain("/mcp")
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  test("init rejects an unknown client", async () => {
+    const result = await runCli(["init", "--client", "notepad"], { env: { SECAPI_API_KEY: "ods_live_INIT_KEY" } })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain("Unknown client")
+  })
+
+  test("init without a client prints usage", async () => {
+    const result = await runCli(["init"])
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain("Usage: secapi init --client")
+  })
+
+  test("init still rejects an API key passed as an argv flag", async () => {
+    const result = await runCli(["init", "--client", "cursor", "--api-key", "ods_live_ARGV_SHOULD_NOT_LEAK"])
+    expect(result.status).toBe(1)
+    assertNoSecretLeak(result.stdout, result.stderr)
   })
 })

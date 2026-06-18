@@ -8,6 +8,23 @@ Command-line interface for SEC API factor data, SEC filings, financial statement
 npm install -g @secapi/cli
 ```
 
+## Connect an agent
+
+Wire the hosted MCP server into your agent client in one command:
+
+```bash
+secapi init --client claude-code      # prints the `claude mcp add` command
+secapi init --client cursor           # writes .cursor/mcp.json
+secapi init --client claude-desktop   # writes the Claude Desktop config
+secapi init --client windsurf         # writes ~/.codeium/windsurf/mcp_config.json
+secapi init --client project          # writes ./.mcp.json
+secapi init --client cursor --print   # dry-run: print the config, write nothing
+```
+
+`secapi init` reads your key from `SECAPI_API_KEY` (or `--api-key-stdin`) and never
+accepts it as an argv flag. `secapi agent-context` prints a machine-readable JSON
+description of the whole CLI surface so an agent can learn the tool in one call.
+
 ## Configuration
 
 ```bash
