@@ -5,7 +5,7 @@
     "": {
       "name": "@secapi/cli",
       "dependencies": {
-        "@secapi/sdk-js": "^1.0.0",
+        "@secapi/sdk-js": "^1.0.2",
       },
       "devDependencies": {
         "@types/node": "^24.10.1",
@@ -14,7 +14,7 @@
     },
   },
   "packages": {
-    "@secapi/sdk-js": ["@secapi/sdk-js@1.0.0", "", { "dependencies": { "zod": "^4.4.3" } }, "sha512-zBS+sRopU7fQW9CzCg8bO/FNOFk2SGhT6R8lia4BWXkvI4McaX6RwEYIWGGbtY6+GzJ0qSWFb3r9QOworedRmw=="],
+    "@secapi/sdk-js": ["@secapi/sdk-js@1.0.2", "", { "dependencies": { "zod": "^4.4.3" } }, "sha512-HW/nCmcM6wuXzG12Fq13wArZw1mxPHGiGjt+VR9YOVuHblilFe1SGtnTcK0cHt0L8CG02LuAFKH0NsjhRALHwg=="],
 
     "@types/node": ["@types/node@24.13.2", "", { "dependencies": { "undici-types": "~7.18.0" } }, "sha512-fRa09kZTgu8o71KFcDjUFuc7F+dEbZYZmkI0mg5YBTRs0yMKjYHsq/c0urDKeDb+D5qVgXOdFcuu+DZPKOITwA=="],
 

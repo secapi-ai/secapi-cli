@@ -810,6 +810,37 @@ function factorResponseParams() {
   }
 }
 
+type MacroCliResponseMode = "compact" | "standard" | "verbose" | "agent"
+
+function getMacroResponseModeFlag(name = "--response-mode"): MacroCliResponseMode | undefined {
+  const raw = getEnumFlag(name, ["compact", "standard", "verbose", "agent", "default"], "macro response mode")
+  return raw === "default" ? "standard" : raw
+}
+
+function getMacroViewResponseModeFlag(name = "--view"): MacroCliResponseMode | undefined {
+  const raw = getUniqueFlag(name)
+  if (raw === undefined) return undefined
+  const aliases: Record<string, MacroCliResponseMode> = {
+    agent: "agent",
+    compact: "compact",
+    default: "standard",
+    standard: "standard",
+    verbose: "verbose",
+  }
+  const normalized = raw.trim().toLowerCase()
+  const mapped = aliases[normalized]
+  if (mapped) return mapped
+  throw new Error(`${name} must be one of: default, agent, compact, standard, verbose (macro response view)`)
+}
+
+function macroResponseParams() {
+  const include = getListFlag("--include") ?? getListFlag("--expand")
+  return {
+    response_mode: getMacroResponseModeFlag("--response-mode") ?? getMacroViewResponseModeFlag("--view"),
+    include: include?.join(","),
+  }
+}
+
 function factorKeySelectionParams() {
   return {
     keys: getListFlag("--keys") ?? getListFlag("--factors"),
@@ -1367,10 +1398,40 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     examples: ["secapi macro search --q inflation --country US --limit 10"],
   },
   "macro indicators": {
-    usage: "secapi macro indicators --indicator <key> [--country <country>]",
+    usage: "secapi macro indicators --indicator <key> [--country <country>] [--response-mode compact|standard|verbose|agent]",
     summary: "Fetch macro observations for one country and indicator key.",
-    flags: ["--indicator <key>", "--indicator-key <key>", "--country <country>", "--limit <n>"],
-    examples: ["secapi macro indicators --country US --indicator CPIAUCSL --limit 12"],
+    flags: ["--indicator <key>", "--indicator-key <key>", "--country <country>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro indicators --country US --indicator CPIAUCSL --limit 12 --response-mode compact"],
+  },
+  "macro high-signal-pack": {
+    usage: "secapi macro high-signal-pack [--country <country>] [--response-mode compact|standard|verbose|agent]",
+    summary: "Fetch the compact high-signal macro pack for a country, with expansion controls for full series and trust metadata.",
+    flags: ["--country <country>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro high-signal-pack --country US", "secapi macro high-signal-pack --country US --response-mode standard --include series,trust"],
+  },
+  "macro releases": {
+    usage: "secapi macro releases [--country <country>] [--status released|scheduled] [--limit <n>]",
+    summary: "Fetch released macro history by default, or upcoming scheduled events with --status scheduled.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--status <released|scheduled>", "--days <n>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro releases --country US --status released --limit 10", "secapi macro releases --country US --status scheduled --days 45 --response-mode compact"],
+  },
+  "macro calendar": {
+    usage: "secapi macro calendar [--country <country>] [--days <n>] [--limit <n>]",
+    summary: "Fetch upcoming scheduled macro releases only.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--days <n>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro calendar --country US --days 30 --limit 12 --response-mode compact"],
+  },
+  "macro forecasts": {
+    usage: "secapi macro forecasts [--country <country>] [--indicator <key>] [--horizons <n>]",
+    summary: "Fetch compact baseline macro forecasts; country-wide calls default to compact at the API.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--horizons <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro forecasts --country US --horizons 2 --response-mode compact"],
+  },
+  "macro regimes": {
+    usage: "secapi macro regimes [--country <country>] [--lookback <window>]",
+    summary: "Fetch the current macro regime classification as a list envelope.",
+    flags: ["--country <country>", "--lookback <window>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro regimes --country US --lookback 18m --response-mode compact"],
   },
   "macro credit-ratings": {
     usage: "secapi macro credit-ratings [--country <country>]",
@@ -2105,7 +2166,12 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "intelligence security": { requiredFlags: ["--ticker|--cik"], examples: ["secapi intelligence security --ticker AAPL --view compact"] },
   "limits show": { output: "human_or_json", examples: ["secapi limits show", "secapi limits show --json=false"] },
   "macro search": { requiredFlags: ["--q|--query"], examples: ["secapi macro search --q inflation --country US"] },
-  "macro indicators": { requiredFlags: ["--indicator|--indicator-key"], examples: ["secapi macro indicators --country US --indicator CPIAUCSL"] },
+  "macro indicators": { requiredFlags: ["--indicator|--indicator-key"], examples: ["secapi macro indicators --country US --indicator CPIAUCSL --response-mode compact"] },
+  "macro high-signal-pack": { examples: ["secapi macro high-signal-pack --country US", "secapi macro high-signal-pack --country US --response-mode standard --include series,trust"] },
+  "macro releases": { examples: ["secapi macro releases --country US --status released --limit 10"] },
+  "macro calendar": { examples: ["secapi macro calendar --country US --days 30 --limit 12 --response-mode compact"] },
+  "macro forecasts": { examples: ["secapi macro forecasts --country US --horizons 2 --response-mode compact"] },
+  "macro regimes": { examples: ["secapi macro regimes --country US --lookback 18m --response-mode compact"] },
   "macro credit-ratings": { examples: ["secapi macro credit-ratings --country US"] },
   "macro credit-rating": { requiredFlags: ["--country"], examples: ["secapi macro credit-rating --country US"] },
   me: { output: "human_or_json", examples: ["secapi me", "secapi me --json=false"] },
@@ -3419,6 +3485,7 @@ async function main() {
   if (group === "macro" && command === "high-signal-pack") {
     print(await apiClient.macroHighSignalPack({
       country: getFlag("--country"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3427,6 +3494,7 @@ async function main() {
     print(await apiClient.macroRegimes({
       country: getFlag("--country"),
       lookback: getFlag("--lookback"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3438,6 +3506,7 @@ async function main() {
       country: getFlag("--country") ?? "US",
       indicator_key: indicatorKey,
       limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3446,7 +3515,10 @@ async function main() {
     print(await apiClient.macroReleases({
       country: getFlag("--country"),
       indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
+      status: getEnumFlag("--status", ["released", "scheduled"], "macro release status"),
+      days: getNumberFlag("--days"),
       limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3454,7 +3526,10 @@ async function main() {
   if (group === "macro" && command === "calendar") {
     print(await apiClient.macroCalendar({
       country: getFlag("--country"),
+      indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
       days: getNumberFlag("--days"),
+      limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3464,6 +3539,7 @@ async function main() {
       country: getFlag("--country"),
       indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
       horizons: getNumberFlag("--horizons"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -4303,10 +4379,10 @@ async function main() {
     "  secapi macro search --q inflation --country US",
     "  secapi macro high-signal-pack --country US",
     "  secapi macro regimes --country US --lookback 18m",
-    "  secapi macro indicators --country US --indicator CPIAUCSL",
-    "  secapi macro releases --country US",
-    "  secapi macro calendar --country US --days 30",
-    "  secapi macro forecasts --country US",
+    "  secapi macro indicators --country US --indicator CPIAUCSL --response-mode compact",
+    "  secapi macro releases --country US --status released",
+    "  secapi macro calendar --country US --days 30 --limit 12 --response-mode compact",
+    "  secapi macro forecasts --country US --response-mode compact",
     "  secapi macro credit-ratings --country US",
     "",
     "  # Factors",

@@ -3064,6 +3064,83 @@ describe("CLI macro commands", () => {
     assertNoSecretLeak(search.stdout + ratings.stdout + rating.stdout, search.stderr + ratings.stderr + rating.stderr)
   })
 
+  test("macro response controls and release filters reach REST query params", async () => {
+    const releases = await runCli([
+      "macro",
+      "releases",
+      "--country",
+      "US",
+      "--indicator",
+      "CPIAUCSL",
+      "--status",
+      "scheduled",
+      "--days",
+      "45",
+      "--limit",
+      "12",
+      "--response-mode",
+      "compact",
+      "--include",
+      "trust,series",
+    ], { env: auth })
+
+    expect(releases.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/macro/releases")
+    expect(requests[0]?.searchParams).toMatchObject({
+      country: "US",
+      indicator_key: "CPIAUCSL",
+      status: "scheduled",
+      days: "45",
+      limit: "12",
+      response_mode: "compact",
+      include: "trust,series",
+    })
+
+    requests = []
+    const calendar = await runCli([
+      "macro",
+      "calendar",
+      "--country",
+      "US",
+      "--indicator-key",
+      "CPIAUCSL",
+      "--limit",
+      "6",
+      "--view",
+      "agent",
+    ], { env: auth })
+
+    expect(calendar.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/macro/calendar")
+    expect(requests[0]?.searchParams).toMatchObject({
+      country: "US",
+      indicator_key: "CPIAUCSL",
+      limit: "6",
+      response_mode: "agent",
+    })
+
+    requests = []
+    const pack = await runCli([
+      "macro",
+      "high-signal-pack",
+      "--country",
+      "US",
+      "--response-mode",
+      "standard",
+      "--include",
+      "series,trust",
+    ], { env: auth })
+
+    expect(pack.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/macro/high-signal-pack")
+    expect(requests[0]?.searchParams).toMatchObject({
+      country: "US",
+      response_mode: "standard",
+      include: "series,trust",
+    })
+    assertNoSecretLeak(releases.stdout + calendar.stdout + pack.stdout, releases.stderr + calendar.stderr + pack.stderr)
+  })
+
   test("macro commands fail locally when required lookup arguments are missing", async () => {
     const missingSearch = await runCli(["macro", "search"], { env: auth })
     expect(missingSearch.status).toBe(1)
@@ -3104,7 +3181,7 @@ describe("CLI agent setup (init + agent-context)", () => {
     expect(groups.get("traces")).toContain("secapi traces get --trace-id <trace_id>")
     expect(groups.get("dilution")).toContain("secapi dilution events")
     expect(groups.get("macro")).toContain("secapi macro search --q <query> [--country <country>] [--limit <n>]")
-    expect(groups.get("macro")).toContain("secapi macro calendar")
+    expect(groups.get("macro")).toContain("secapi macro calendar [--country <country>] [--days <n>] [--limit <n>]")
     expect(groups.get("macro")).toContain("secapi macro credit-rating --country <country>")
     expect(groups.get("artifacts")).toContain("secapi artifacts bundle")
     expect(groups.get("webhooks")).toContain("secapi webhooks create")

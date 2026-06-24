@@ -40,6 +40,10 @@ Run `bun run scripts/validate/check_cli_doc_snippets.ts` whenever CLI examples,
 command names, or public Mintlify snippets change; it rewrites
 `ops/docs-health/cli-doc-snippets/latest.json`.
 
+Release order: publish `@secapi/sdk-js@1.0.2` before `@secapi/cli@1.0.2`.
+The CLI package depends on `@secapi/sdk-js@^1.0.2`; validating the CLI against a
+local sibling SDK is not enough until the SDK version is available on npm.
+
 ## Connect an agent
 
 Wire the hosted MCP server into your agent client in one command:
@@ -102,7 +106,7 @@ secapi config profiles
 Two binaries are installed: the preferred `secapi` and the compatibility alias `omni-sec`.
 
 ```bash
-secapi --version   # prints the bare package version, e.g. 1.0.1
+secapi --version   # prints the bare package version, e.g. 1.0.2
 secapi --help      # short task-oriented help for common workflows
 secapi help all    # full command inventory
 secapi examples    # local starter workflows for humans and agents
