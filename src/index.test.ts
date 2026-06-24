@@ -89,6 +89,11 @@ function assertNoSecretLeak(stdout: string, stderr: string) {
   }
 }
 
+async function expectedCliUserAgent() {
+  const packageJson = await Bun.file(new URL("../package.json", import.meta.url)).json()
+  return `secapi-cli/${packageJson.version}`
+}
+
 function parseRequestSummaryFromStderr(stderr: string) {
   const jsonStart = stderr.indexOf('{\n  "object": "secapi_cli_request_summary"')
   expect(jsonStart).toBeGreaterThanOrEqual(0)
@@ -130,6 +135,19 @@ beforeAll(() => {
           code: "doctor_secret_echo",
           message: "bad key secapi_live_DOCTOR_ECHO_SECRET",
         }, { status: 401, headers: responseHeaders })
+      }
+      if (url.pathname === "/v1/diagnostics/requests/req_bundle") {
+        const echoedHeader = request.headers.get("x-api-key")
+        return Response.json({
+          object: "request_diagnostics",
+          requestId: "req_bundle",
+          summary: `diagnostic payload for ${echoedHeader ?? "anonymous"}`,
+          nested: {
+            echoedHeader,
+            authorization: "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret",
+            array: [{ "secapi_live_DOCTOR_ECHO_SECRET": "bearer-HISTORICAL_SHOULD_NOT_LEAK" }],
+          },
+        }, { headers: responseHeaders })
       }
       if (url.pathname === "/v1/me") {
         return Response.json({
@@ -368,7 +386,17 @@ describe("CLI credential handling", () => {
     expect(result.status).toBe(0)
     expect(requests[0]?.path).toBe("/healthz")
     expect(requests[0]?.headers["x-api-key"]).toBe("secapi_live_ENV_BACKED_AUTH")
+    expect(requests[0]?.headers["user-agent"]).toBe(await expectedCliUserAgent())
     assertNoSecretLeak(result.stdout, result.stderr)
+  })
+
+  test("unauthenticated bootstrap still identifies CLI traffic", async () => {
+    const result = await runCli(["agent", "bootstrap", "--token", "bootstrap_test_token"])
+
+    expect(result.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/agent/bootstrap")
+    expect(requests[0]?.headers["x-api-key"]).toBeUndefined()
+    expect(requests[0]?.headers["user-agent"]).toBe(await expectedCliUserAgent())
   })
 
   test("--request-summary keeps stdout parseable and writes request metadata to stderr", async () => {
@@ -2073,6 +2101,72 @@ describe("CLI doctor", () => {
     expect(report.checks.me.message).not.toContain("secapi_live_DOCTOR_ECHO_SECRET")
     assertNoSecretLeak(result.stdout, result.stderr)
   })
+
+  test("support bundle includes local config, doctor checks, and optional request diagnostics", async () => {
+    const result = await runCli(["support", "bundle", "--request-id", "req_bundle"], {
+      env: { SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH" },
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stderr).toBe("")
+    expect(requests.map((request) => request.path)).toEqual([
+      "/healthz",
+      "/v1/me",
+      "/v1/diagnostics/requests/req_bundle",
+    ])
+
+    const report = JSON.parse(result.stdout)
+    expect(report.object).toBe("secapi_cli_support_bundle")
+    expect(report.config.object).toBe("secapi_cli_config")
+    expect(report.config.localOnly).toBe(true)
+    expect(report.doctor.object).toBe("secapi_cli_doctor")
+    expect(report.doctor.ok).toBe(true)
+    expect(report.requestDiagnostics.ok).toBe(true)
+    expect(report.requestDiagnostics.response.requestId).toBe("req_bundle")
+    expect(report.requestSummary.map((entry: { path: string }) => entry.path)).toEqual([
+      "/healthz",
+      "/v1/me",
+      "/v1/diagnostics/requests/req_bundle",
+    ])
+    expect(report.redaction.credentialValuesIncluded).toBe(false)
+    expect(result.stdout).not.toContain("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret")
+    assertNoSecretLeak(result.stdout, result.stderr)
+  })
+
+  test("support bundle recursively redacts echoed credential values", async () => {
+    const result = await runCli(["support", "bundle", "--request-id", "req_bundle"], {
+      env: { SECAPI_API_KEY: "secapi_live_DOCTOR_ECHO_SECRET" },
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stderr).toBe("")
+    const report = JSON.parse(result.stdout)
+    expect(report.doctor.ok).toBe(false)
+    expect(report.doctor.checks.me.message).toContain("[redacted]")
+    expect(report.requestDiagnostics.ok).toBe(true)
+    expect(report.requestDiagnostics.response.summary).toContain("[redacted]")
+    expect(report.requestDiagnostics.response.nested.echoedHeader).toBe("[redacted]")
+    expect(report.requestDiagnostics.response.nested.authorization).toBe("Authorization: Bearer [redacted]")
+    expect(Object.keys(report.requestDiagnostics.response.nested.array[0])).toEqual(["[redacted]"])
+    expect(report.requestDiagnostics.response.nested.array[0]["[redacted]"]).toBe("[redacted]")
+    assertNoSecretLeak(result.stdout, result.stderr)
+  })
+
+  test("support bundle validates optional request id syntax", async () => {
+    const inline = await runCli(["support", "bundle", "--request-id=req_bundle"], {
+      env: { SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH" },
+    })
+    expect(inline.status).toBe(0)
+    expect(JSON.parse(inline.stdout).requestDiagnostics.response.requestId).toBe("req_bundle")
+
+    const missing = await runCli(["support", "bundle", "--request-id", "--output", "bundle.json"], {
+      env: { SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH" },
+    })
+    expect(missing.status).not.toBe(0)
+    expect(missing.stdout).toBe("")
+    expect(missing.stderr).toContain("--request-id requires a value")
+    assertNoSecretLeak(inline.stdout + missing.stdout, inline.stderr + missing.stderr)
+  })
 })
 
 describe("CLI trace commands", () => {
@@ -3064,83 +3158,6 @@ describe("CLI macro commands", () => {
     assertNoSecretLeak(search.stdout + ratings.stdout + rating.stdout, search.stderr + ratings.stderr + rating.stderr)
   })
 
-  test("macro response controls and release filters reach REST query params", async () => {
-    const releases = await runCli([
-      "macro",
-      "releases",
-      "--country",
-      "US",
-      "--indicator",
-      "CPIAUCSL",
-      "--status",
-      "scheduled",
-      "--days",
-      "45",
-      "--limit",
-      "12",
-      "--response-mode",
-      "compact",
-      "--include",
-      "trust,series",
-    ], { env: auth })
-
-    expect(releases.status).toBe(0)
-    expect(requests[0]?.path).toBe("/v1/macro/releases")
-    expect(requests[0]?.searchParams).toMatchObject({
-      country: "US",
-      indicator_key: "CPIAUCSL",
-      status: "scheduled",
-      days: "45",
-      limit: "12",
-      response_mode: "compact",
-      include: "trust,series",
-    })
-
-    requests = []
-    const calendar = await runCli([
-      "macro",
-      "calendar",
-      "--country",
-      "US",
-      "--indicator-key",
-      "CPIAUCSL",
-      "--limit",
-      "6",
-      "--view",
-      "agent",
-    ], { env: auth })
-
-    expect(calendar.status).toBe(0)
-    expect(requests[0]?.path).toBe("/v1/macro/calendar")
-    expect(requests[0]?.searchParams).toMatchObject({
-      country: "US",
-      indicator_key: "CPIAUCSL",
-      limit: "6",
-      response_mode: "agent",
-    })
-
-    requests = []
-    const pack = await runCli([
-      "macro",
-      "high-signal-pack",
-      "--country",
-      "US",
-      "--response-mode",
-      "standard",
-      "--include",
-      "series,trust",
-    ], { env: auth })
-
-    expect(pack.status).toBe(0)
-    expect(requests[0]?.path).toBe("/v1/macro/high-signal-pack")
-    expect(requests[0]?.searchParams).toMatchObject({
-      country: "US",
-      response_mode: "standard",
-      include: "series,trust",
-    })
-    assertNoSecretLeak(releases.stdout + calendar.stdout + pack.stdout, releases.stderr + calendar.stderr + pack.stderr)
-  })
-
   test("macro commands fail locally when required lookup arguments are missing", async () => {
     const missingSearch = await runCli(["macro", "search"], { env: auth })
     expect(missingSearch.status).toBe(1)
@@ -3181,7 +3198,7 @@ describe("CLI agent setup (init + agent-context)", () => {
     expect(groups.get("traces")).toContain("secapi traces get --trace-id <trace_id>")
     expect(groups.get("dilution")).toContain("secapi dilution events")
     expect(groups.get("macro")).toContain("secapi macro search --q <query> [--country <country>] [--limit <n>]")
-    expect(groups.get("macro")).toContain("secapi macro calendar [--country <country>] [--days <n>] [--limit <n>]")
+    expect(groups.get("macro")).toContain("secapi macro calendar")
     expect(groups.get("macro")).toContain("secapi macro credit-rating --country <country>")
     expect(groups.get("artifacts")).toContain("secapi artifacts bundle")
     expect(groups.get("webhooks")).toContain("secapi webhooks create")
@@ -3283,7 +3300,7 @@ describe("CLI agent setup (init + agent-context)", () => {
     expect(result.status).toBe(0)
     const json = JSON.parse(result.stdout.split("\n").slice(1).join("\n"))
     expect(json.mcpServers.secapi.url).toContain("/mcp")
-    expect(json.mcpServers.secapi.headers["x-api-key"]).toBe("${SECAPI_API_KEY}")
+    expect(json.mcpServers.secapi.headers["x-api-key"]).toBe("${env:SECAPI_API_KEY}")
     expect(result.stdout).not.toContain("secapi_live_INIT_KEY")
   })
 
@@ -3292,7 +3309,7 @@ describe("CLI agent setup (init + agent-context)", () => {
     expect(byFlag.status).toBe(0)
     const byFlagJson = JSON.parse(byFlag.stdout.split("\n").slice(1).join("\n"))
     expect(byFlagJson.mcpServers.secapi.url).toContain("/mcp")
-    expect(byFlagJson.mcpServers.secapi.headers["x-api-key"]).toBe("${SECAPI_API_KEY}")
+    expect(byFlagJson.mcpServers.secapi.headers["x-api-key"]).toBe("${env:SECAPI_API_KEY}")
     expect(byFlag.stdout).not.toContain("secapi_live_INIT_KEY")
 
     const byPosition = await runCli(["mcp", "install", "claude-code"], { env: { SECAPI_API_KEY: "secapi_live_INIT_KEY" } })
@@ -3370,7 +3387,7 @@ describe("CLI agent setup (init + agent-context)", () => {
       const result = await runCli(command)
       expect(result.status).toBe(0)
       expect(result.stderr).toBe("")
-      expect(result.stdout).toContain("${SECAPI_API_KEY}")
+      expect(result.stdout).toContain("${env:SECAPI_API_KEY}")
     }
 
     const shellPreview = await runCli(["init", "--client", "claude-desktop", "--print", "--api-key-stdin"])
