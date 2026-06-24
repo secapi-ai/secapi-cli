@@ -1360,6 +1360,30 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     flags: ["--json=false", "--request-summary", "--output <file>"],
     examples: ["secapi limits show", "secapi limits show --json=false"],
   },
+  "macro search": {
+    usage: "secapi macro search --q <query> [--country <country>] [--limit <n>]",
+    summary: "Search macro indicator keys before fetching observations, releases, forecasts, or country reports.",
+    flags: ["--q <query>", "--query <query>", "--country <country>", "--frequency <frequency>", "--limit <n>"],
+    examples: ["secapi macro search --q inflation --country US --limit 10"],
+  },
+  "macro indicators": {
+    usage: "secapi macro indicators --indicator <key> [--country <country>]",
+    summary: "Fetch macro observations for one country and indicator key.",
+    flags: ["--indicator <key>", "--indicator-key <key>", "--country <country>", "--limit <n>"],
+    examples: ["secapi macro indicators --country US --indicator CPIAUCSL --limit 12"],
+  },
+  "macro credit-ratings": {
+    usage: "secapi macro credit-ratings [--country <country>]",
+    summary: "List sovereign credit ratings for tracked countries and G20 members.",
+    flags: ["--country <country>"],
+    examples: ["secapi macro credit-ratings --country US"],
+  },
+  "macro credit-rating": {
+    usage: "secapi macro credit-rating --country <country>",
+    summary: "Fetch one country's sovereign credit rating by ISO country code.",
+    flags: ["--country <country>"],
+    examples: ["secapi macro credit-rating --country US"],
+  },
   "entities resolve": {
     usage: "secapi entities resolve --ticker <symbol> | --cik <cik> | --query <name>",
     summary: "Resolve ticker, CIK, or company name to canonical SEC API entity metadata.",
@@ -1492,6 +1516,7 @@ const GROUP_HELP: Record<string, string[]> = {
   entities: ["entities resolve"],
   factors: ["factors exposures", "factors valuations"],
   filings: ["filings search", "filings latest"],
+  macro: ["macro search", "macro indicators", "macro high-signal-pack", "macro releases", "macro calendar", "macro forecasts", "macro regimes", "macro credit-ratings", "macro credit-rating"],
   mcp: ["mcp install"],
   limits: ["limits show"],
   portfolio: ["portfolio analyze"],
@@ -1602,11 +1627,14 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "intelligence security",
   "limits show",
   "macro calendar",
+  "macro credit-rating",
+  "macro credit-ratings",
   "macro forecasts",
   "macro high-signal-pack",
   "macro indicators",
   "macro regimes",
   "macro releases",
+  "macro search",
   "mcp install",
   "me",
   "model-portfolios factor-view",
@@ -2076,6 +2104,10 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "intelligence footnotes-query": { requiredFlags: ["--ticker|--cik", "--q|--query"], examples: ["secapi intelligence footnotes-query --ticker AAPL --q leases"] },
   "intelligence security": { requiredFlags: ["--ticker|--cik"], examples: ["secapi intelligence security --ticker AAPL --view compact"] },
   "limits show": { output: "human_or_json", examples: ["secapi limits show", "secapi limits show --json=false"] },
+  "macro search": { requiredFlags: ["--q|--query"], examples: ["secapi macro search --q inflation --country US"] },
+  "macro indicators": { requiredFlags: ["--indicator|--indicator-key"], examples: ["secapi macro indicators --country US --indicator CPIAUCSL"] },
+  "macro credit-ratings": { examples: ["secapi macro credit-ratings --country US"] },
+  "macro credit-rating": { requiredFlags: ["--country"], examples: ["secapi macro credit-rating --country US"] },
   me: { output: "human_or_json", examples: ["secapi me", "secapi me --json=false"] },
   "mcp install": { auth: "optional_api_key", mutates: true, output: "file_or_text", requiredFlags: ["--client"], examples: ["secapi mcp install --client claude-code"] },
   "model-portfolios factor-view": { requiredFlags: ["--portfolio-id"], examples: ["secapi model-portfolios factor-view --portfolio-id mp_... --response-mode compact"] },
@@ -3372,6 +3404,18 @@ async function main() {
   }
 
   // --- Macro commands ---
+  if (group === "macro" && command === "search") {
+    const query = getFlag("--q") ?? getFlag("--query")
+    if (!query) throw new Error("--q or --query is required")
+    print(await apiClient.macroSearch({
+      q: query,
+      country: getFlag("--country"),
+      frequency: getFlag("--frequency"),
+      limit: getNumberFlag("--limit"),
+    }))
+    return
+  }
+
   if (group === "macro" && command === "high-signal-pack") {
     print(await apiClient.macroHighSignalPack({
       country: getFlag("--country"),
@@ -3388,9 +3432,11 @@ async function main() {
   }
 
   if (group === "macro" && command === "indicators") {
+    const indicatorKey = getFlag("--indicator") ?? getFlag("--indicator-key")
+    if (!indicatorKey) throw new Error("--indicator or --indicator-key is required")
     print(await apiClient.macroIndicators({
       country: getFlag("--country") ?? "US",
-      indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key") ?? "",
+      indicator_key: indicatorKey,
       limit: getNumberFlag("--limit"),
     }))
     return
@@ -3419,6 +3465,20 @@ async function main() {
       indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
       horizons: getNumberFlag("--horizons"),
     }))
+    return
+  }
+
+  if (group === "macro" && command === "credit-ratings") {
+    print(await apiClient.macroCreditRatings({
+      country: getFlag("--country"),
+    }))
+    return
+  }
+
+  if (group === "macro" && command === "credit-rating") {
+    const country = getFlag("--country")
+    if (!country) throw new Error("--country is required")
+    print(await apiClient.macroCreditRating(country))
     return
   }
 
@@ -4240,12 +4300,14 @@ async function main() {
     "  secapi artifacts reconcile --artifact-id art_...",
     "",
     "  # Macro",
-    "  secapi macro high-signal-pack --country JP",
+    "  secapi macro search --q inflation --country US",
+    "  secapi macro high-signal-pack --country US",
     "  secapi macro regimes --country US --lookback 18m",
-    "  secapi macro indicators --country US --indicator GDP",
+    "  secapi macro indicators --country US --indicator CPIAUCSL",
     "  secapi macro releases --country US",
     "  secapi macro calendar --country US --days 30",
     "  secapi macro forecasts --country US",
+    "  secapi macro credit-ratings --country US",
     "",
     "  # Factors",
     "  secapi factors catalog --category style",

@@ -3025,6 +3025,67 @@ describe("CLI portfolio and model factor commands", () => {
   })
 })
 
+describe("CLI macro commands", () => {
+  const auth = { SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH" }
+
+  test("macro search and sovereign credit-rating commands forward documented routes", async () => {
+    const search = await runCli([
+      "macro",
+      "search",
+      "--q",
+      "inflation",
+      "--country",
+      "US",
+      "--frequency",
+      "monthly",
+      "--limit",
+      "10",
+    ], { env: auth })
+
+    expect(search.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/macro/search")
+    expect(requests[0]?.searchParams).toMatchObject({
+      q: "inflation",
+      country: "US",
+      frequency: "monthly",
+      limit: "10",
+    })
+
+    requests = []
+    const ratings = await runCli(["macro", "credit-ratings", "--country", "US"], { env: auth })
+    expect(ratings.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/macro/credit-ratings")
+    expect(requests[0]?.searchParams.country).toBe("US")
+
+    requests = []
+    const rating = await runCli(["macro", "credit-rating", "--country", "United States"], { env: auth })
+    expect(rating.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/macro/credit-ratings/United%20States")
+    assertNoSecretLeak(search.stdout + ratings.stdout + rating.stdout, search.stderr + ratings.stderr + rating.stderr)
+  })
+
+  test("macro commands fail locally when required lookup arguments are missing", async () => {
+    const missingSearch = await runCli(["macro", "search"], { env: auth })
+    expect(missingSearch.status).toBe(1)
+    expect(missingSearch.stderr).toContain("--q or --query is required")
+    expect(requests).toHaveLength(0)
+
+    const missingIndicator = await runCli(["macro", "indicators", "--country", "US"], { env: auth })
+    expect(missingIndicator.status).toBe(1)
+    expect(missingIndicator.stderr).toContain("--indicator or --indicator-key is required")
+    expect(requests).toHaveLength(0)
+
+    const missingCountry = await runCli(["macro", "credit-rating"], { env: auth })
+    expect(missingCountry.status).toBe(1)
+    expect(missingCountry.stderr).toContain("--country is required")
+    expect(requests).toHaveLength(0)
+    assertNoSecretLeak(
+      missingSearch.stdout + missingIndicator.stdout + missingCountry.stdout,
+      missingSearch.stderr + missingIndicator.stderr + missingCountry.stderr,
+    )
+  })
+})
+
 describe("CLI agent setup (init + agent-context)", () => {
   test("agent-context emits machine-readable JSON describing the CLI surface", async () => {
     const result = await runCli(["agent-context"])
@@ -3042,7 +3103,9 @@ describe("CLI agent setup (init + agent-context)", () => {
     expect(groups.get("config")).toContain("secapi config profiles")
     expect(groups.get("traces")).toContain("secapi traces get --trace-id <trace_id>")
     expect(groups.get("dilution")).toContain("secapi dilution events")
+    expect(groups.get("macro")).toContain("secapi macro search --q <query> [--country <country>] [--limit <n>]")
     expect(groups.get("macro")).toContain("secapi macro calendar")
+    expect(groups.get("macro")).toContain("secapi macro credit-rating --country <country>")
     expect(groups.get("artifacts")).toContain("secapi artifacts bundle")
     expect(groups.get("webhooks")).toContain("secapi webhooks create")
     expect(groups.get("models")).toContain("secapi models factor-analysis")

@@ -102,7 +102,7 @@ secapi config profiles
 Two binaries are installed: the preferred `secapi` and the compatibility alias `omni-sec`.
 
 ```bash
-secapi --version   # prints the bare package version, e.g. 1.0.0
+secapi --version   # prints the bare package version, e.g. 1.0.1
 secapi --help      # short task-oriented help for common workflows
 secapi help all    # full command inventory
 secapi examples    # local starter workflows for humans and agents
