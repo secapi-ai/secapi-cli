@@ -161,6 +161,15 @@ Run `secapi doctor` when local setup is suspect. It reports the active base URL,
 credential source names, API health, authenticated account context when
 available, and the hosted MCP URL without printing credential values.
 
+Run `secapi support bundle` when you need a copy-paste packet for support or an
+agent handoff. It combines local config, `doctor` checks, request summaries, and
+optional request drilldown into one JSON object while recursively redacting
+credential values:
+
+```bash
+secapi support bundle --request-id req_...
+```
+
 Run `secapi config show` when you only need the local CLI configuration. It
 prints the active base URL, source names for configured credentials, and hosted
 MCP URL without reading stdin, calling the API, or printing credential values.
