@@ -10,8 +10,8 @@ import {
   listPromptsByPersona,
   type AgentPrompt,
   type AgentPromptPersona,
-} from "../../contracts/src/index.ts"
-import { SecApiClient, type FactorApiResponseMode, type ResponseView } from "../../sdk-js/src/index.ts"
+} from "./generated-contracts/agent-prompts.js"
+import { SecApiClient, type FactorApiResponseMode, type ResponseView } from "@secapi/sdk-js"
 
 let args = process.argv.slice(2)
 let baseUrl = "https://api.secapi.ai"
