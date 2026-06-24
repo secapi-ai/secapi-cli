@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process"
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { getPrompt } from "../../contracts/src/index.ts"
+import { getPrompt } from "./generated-contracts/agent-prompts.js"
 
 const cliEntry = new URL("./index.ts", import.meta.url)
 const secretValues = [
