@@ -1,6 +1,6 @@
 {
   "name": "@secapi/cli",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "description": "SEC API CLI for SEC data shaped for investors and agents",
   "type": "module",
   "bin": {
@@ -10,13 +10,6 @@
   "files": [
     "dist"
   ],
-  "dependencies": {
-    "@secapi/sdk-js": "^0.5.0"
-  },
-  "devDependencies": {
-    "@types/node": "^24.10.1",
-    "typescript": "^5.9.3"
-  },
   "scripts": {
     "build": "bun build src/index.ts --outfile dist/index.js --target node && chmod +x dist/index.js",
     "prepack": "bun run build",
@@ -45,5 +38,12 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@secapi/sdk-js": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^6.0.3"
   }
 }
