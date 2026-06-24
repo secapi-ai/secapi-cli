@@ -40,10 +40,6 @@ Run `bun run scripts/validate/check_cli_doc_snippets.ts` whenever CLI examples,
 command names, or public Mintlify snippets change; it rewrites
 `ops/docs-health/cli-doc-snippets/latest.json`.
 
-Release order: publish `@secapi/sdk-js@1.0.2` before `@secapi/cli@1.0.2`.
-The CLI package depends on `@secapi/sdk-js@^1.0.2`; validating the CLI against a
-local sibling SDK is not enough until the SDK version is available on npm.
-
 ## Connect an agent
 
 Wire the hosted MCP server into your agent client in one command:
@@ -164,6 +160,15 @@ secapi health --request-summary
 Run `secapi doctor` when local setup is suspect. It reports the active base URL,
 credential source names, API health, authenticated account context when
 available, and the hosted MCP URL without printing credential values.
+
+Run `secapi support bundle` when you need a copy-paste packet for support or an
+agent handoff. It combines local config, `doctor` checks, request summaries, and
+optional request drilldown into one JSON object while recursively redacting
+credential values:
+
+```bash
+secapi support bundle --request-id req_...
+```
 
 Run `secapi config show` when you only need the local CLI configuration. It
 prints the active base URL, source names for configured credentials, and hosted
