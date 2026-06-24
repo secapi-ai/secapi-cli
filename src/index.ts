@@ -810,6 +810,37 @@ function factorResponseParams() {
   }
 }
 
+type MacroCliResponseMode = "compact" | "standard" | "verbose" | "agent"
+
+function getMacroResponseModeFlag(name = "--response-mode"): MacroCliResponseMode | undefined {
+  const raw = getEnumFlag(name, ["compact", "standard", "verbose", "agent", "default"], "macro response mode")
+  return raw === "default" ? "standard" : raw
+}
+
+function getMacroViewResponseModeFlag(name = "--view"): MacroCliResponseMode | undefined {
+  const raw = getUniqueFlag(name)
+  if (raw === undefined) return undefined
+  const aliases: Record<string, MacroCliResponseMode> = {
+    agent: "agent",
+    compact: "compact",
+    default: "standard",
+    standard: "standard",
+    verbose: "verbose",
+  }
+  const normalized = raw.trim().toLowerCase()
+  const mapped = aliases[normalized]
+  if (mapped) return mapped
+  throw new Error(`${name} must be one of: default, agent, compact, standard, verbose (macro response view)`)
+}
+
+function macroResponseParams(defaultResponseMode?: "compact" | "standard" | "verbose" | "agent") {
+  const include = getListFlag("--include") ?? getListFlag("--expand")
+  return {
+    response_mode: getMacroResponseModeFlag("--response-mode") ?? getMacroViewResponseModeFlag("--view") ?? defaultResponseMode,
+    include: include?.join(","),
+  }
+}
+
 function factorKeySelectionParams() {
   return {
     keys: getListFlag("--keys") ?? getListFlag("--factors"),
@@ -1218,7 +1249,7 @@ function defaultClient(credentials: CliCredentials) {
     bearerToken: credentials.bearerToken,
     baseUrl,
     fetch: captureFetch(),
-    headers: cliHeaders(),
+    headers: { "user-agent": `secapi-cli/${cliVersion()}` },
   })
 }
 
@@ -1231,12 +1262,8 @@ function humanClient(credentials: CliCredentials) {
     bearerToken,
     baseUrl,
     fetch: captureFetch(),
-    headers: cliHeaders(),
+    headers: { "user-agent": `secapi-cli/${cliVersion()}` },
   })
-}
-
-function cliHeaders() {
-  return { "user-agent": `secapi-cli/${cliVersion()}` }
 }
 
 function sanitizeDiagnosticText(value: string, credentials: CliCredentials) {
@@ -1246,9 +1273,6 @@ function sanitizeDiagnosticText(value: string, credentials: CliCredentials) {
     out = out.split(secret).join("[redacted]")
   }
   return out
-    .replace(/\b(?:secapi|opr|ods)_(?:live|test|prod|dev|boot)_[A-Za-z0-9._-]+\b/gi, "[redacted]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+\b/g, "Bearer [redacted]")
-    .replace(/\bbearer[_-][A-Za-z0-9._-]+\b/gi, "[redacted]")
 }
 
 function diagnosticError(error: unknown, credentials: CliCredentials) {
@@ -1263,16 +1287,6 @@ function diagnosticError(error: unknown, credentials: CliCredentials) {
   }
 }
 
-function sanitizeDiagnosticValue(value: unknown, credentials: CliCredentials): unknown {
-  if (typeof value === "string") return sanitizeDiagnosticText(value, credentials)
-  if (Array.isArray(value)) return value.map((entry) => sanitizeDiagnosticValue(entry, credentials))
-  if (!value || typeof value !== "object") return value
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .map(([key, entry]) => [sanitizeDiagnosticText(key, credentials), sanitizeDiagnosticValue(entry, credentials)]),
-  )
-}
-
 async function doctorCheck(fn: () => Promise<unknown>, credentials: CliCredentials) {
   try {
     return {
@@ -1282,42 +1296,6 @@ async function doctorCheck(fn: () => Promise<unknown>, credentials: CliCredentia
   } catch (error) {
     return diagnosticError(error, credentials)
   }
-}
-
-async function runSupportBundle(apiClient: SecApiClient, credentials: CliCredentials) {
-  const requestId = getStringFlag("--request-id")
-  const doctor = await runDoctor(apiClient, credentials)
-  const requestDiagnostics = requestId
-    ? await doctorCheck(() => apiClient.requestDiagnostics(requestId), credentials)
-    : {
-        ok: null,
-        skipped: true,
-        reason: "Pass --request-id <Request-Id> to include request-scoped diagnostics.",
-      }
-  const bundle = {
-    object: "secapi_cli_support_bundle",
-    schemaVersion: 1,
-    generatedAt: new Date().toISOString(),
-    cli: {
-      version: cliVersion(),
-      binaries: ["secapi", "omni-sec"],
-    },
-    runtime: {
-      node: process.version,
-      platform: process.platform,
-      arch: process.arch,
-    },
-    config: localConfigReport(),
-    doctor,
-    requestDiagnostics,
-    requestSummary: requestSummaries,
-    redaction: {
-      credentialValuesIncluded: false,
-      credentialSourcesOnly: true,
-      note: "Credential values and echoed credential strings are redacted before output.",
-    },
-  }
-  return sanitizeDiagnosticValue(bundle, credentials)
 }
 
 async function runDoctor(apiClient: SecApiClient, credentials: CliCredentials) {
@@ -1391,12 +1369,6 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     summary: "Run safe CLI diagnostics for base URL, auth, health, account context, and hosted MCP setup.",
     examples: ["secapi doctor"],
   },
-  "support bundle": {
-    usage: "secapi support bundle [--request-id <request_id>]",
-    summary: "Print a redacted support packet with local config, doctor checks, request summaries, and optional request diagnostics.",
-    flags: ["--request-id <request_id>", "--output <file>"],
-    examples: ["secapi support bundle", "secapi support bundle --request-id req_..."],
-  },
   me: {
     usage: "secapi me",
     summary: "Show the authenticated user and organization context.",
@@ -1428,10 +1400,52 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     examples: ["secapi macro search --q inflation --country US --limit 10"],
   },
   "macro indicators": {
-    usage: "secapi macro indicators --indicator <key> [--country <country>]",
+    usage: "secapi macro indicators --indicator <key> [--country <country>] [--response-mode compact|standard|verbose|agent]",
     summary: "Fetch macro observations for one country and indicator key.",
-    flags: ["--indicator <key>", "--indicator-key <key>", "--country <country>", "--limit <n>"],
-    examples: ["secapi macro indicators --country US --indicator CPIAUCSL --limit 12"],
+    flags: ["--indicator <key>", "--indicator-key <key>", "--country <country>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro indicators --country US --indicator CPIAUCSL --limit 12 --response-mode compact"],
+  },
+  "macro high-signal-pack": {
+    usage: "secapi macro high-signal-pack [--country <country>] [--response-mode compact|standard|verbose|agent]",
+    summary: "Fetch the compact high-signal macro pack for a country, with expansion controls for full series and trust metadata.",
+    flags: ["--country <country>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro high-signal-pack --country US", "secapi macro high-signal-pack --country US --response-mode standard --include series,trust"],
+  },
+  "macro status": {
+    usage: "secapi macro status [--country <country>] [--response-mode compact|standard|verbose|agent]",
+    summary: "Check macro freshness, source posture, fallback usage, and degraded states from materialized status artifacts.",
+    flags: ["--country <country>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro status --country US --response-mode compact"],
+  },
+  "macro country-report": {
+    usage: "secapi macro country-report [--country <country>] [--symbols <symbols>] [--horizon <window>] [--briefing-mode macro|portfolio|company]",
+    summary: "Fetch the compact macro investment briefing through the country-report intelligence endpoint.",
+    flags: ["--country <country>", "--symbols <comma-separated symbols>", "--horizon <1m|3m|6m|12m|18m>", "--briefing-mode <mode>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro country-report --country US", "secapi macro country-report --country JP --symbols TM,SONY --response-mode compact"],
+  },
+  "macro releases": {
+    usage: "secapi macro releases [--country <country>] [--status released|scheduled] [--limit <n>]",
+    summary: "Fetch released macro history by default, or upcoming scheduled events with --status scheduled.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--status <released|scheduled>", "--days <n>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro releases --country US --status released --limit 10", "secapi macro releases --country US --status scheduled --days 45 --response-mode compact"],
+  },
+  "macro calendar": {
+    usage: "secapi macro calendar [--country <country>] [--days <n>] [--limit <n>]",
+    summary: "Fetch upcoming scheduled macro releases only.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--days <n>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro calendar --country US --days 30 --limit 12 --response-mode compact"],
+  },
+  "macro forecasts": {
+    usage: "secapi macro forecasts [--country <country>] [--indicator <key>] [--horizons <n>]",
+    summary: "Fetch compact baseline macro forecasts; country-wide calls default to compact at the API.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--horizons <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro forecasts --country US --horizons 2 --response-mode compact"],
+  },
+  "macro regimes": {
+    usage: "secapi macro regimes [--country <country>] [--lookback <window>]",
+    summary: "Fetch the current macro regime classification as a list envelope.",
+    flags: ["--country <country>", "--lookback <window>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro regimes --country US --lookback 18m --response-mode compact"],
   },
   "macro credit-ratings": {
     usage: "secapi macro credit-ratings [--country <country>]",
@@ -1505,6 +1519,12 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     flags: ["--symbols <comma-separated symbols>", "--keys <factor keys>", "--view default|agent|compact|standard|verbose"],
     examples: ["secapi factors exposures --symbols AAPL,MSFT --view agent"],
   },
+  "factors macro-sensitivity": {
+    usage: "secapi factors macro-sensitivity [--country <country>] [--scenario-key <key>] [--keys <factors>]",
+    summary: "Rank factor tailwinds and headwinds for a macro scenario using the heuristic macro-factor sensitivity bridge.",
+    flags: ["--country <country>", "--scenario-key <key>", "--keys <factor keys>", "--factors <factor keys>", "--indicators <indicator keys>", "--lookback <window>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>"],
+    examples: ["secapi factors macro-sensitivity --country US --scenario-key higher_for_longer --keys VALUE,QUALITY"],
+  },
   "factors valuations": {
     usage: "secapi factors valuations [--keys <factor_keys>] [--side tailwind|headwind|neutral|all]",
     summary: "Rank factor-level valuation opportunities and risks.",
@@ -1516,6 +1536,18 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     summary: "Analyze portfolio factor exposure from a holdings payload.",
     flags: ["--holdings-json <json>", "--holdings-file <path>", "--benchmark-label <label>", "--benchmark-holdings-file <path>", "--keys <factor keys>"],
     examples: ["secapi portfolio analyze --holdings-file holdings.json --benchmark-label SPY --benchmark-holdings-file benchmark.json --keys VALUE,QUALITY"],
+  },
+  "portfolio stress-test": {
+    usage: "secapi portfolio stress-test --holdings-json <json> | --holdings-file <path> [--scenario-key <key>]",
+    summary: "Run a portfolio stress test and return factor-level contribution drivers where available.",
+    flags: ["--holdings-json <json>", "--holdings-file <path>", "--scenario-key <key>", "--scenario-json <json>", "--scenario-file <path>", "--response-mode <mode>", "--view <mode>", "--include <fields>"],
+    examples: ["secapi portfolio stress-test --holdings-file holdings.json --scenario-key higher_for_longer"],
+  },
+  "portfolio stress-scenarios": {
+    usage: "secapi portfolio stress-scenarios [--country <country>]",
+    summary: "List supported portfolio stress scenarios before running a stress test.",
+    flags: ["--country <country>", "--response-mode <mode>", "--view <mode>", "--include <fields>"],
+    examples: ["secapi portfolio stress-scenarios --country US"],
   },
   "agents personas": {
     usage: "secapi agents personas [--json]",
@@ -1575,17 +1607,16 @@ const GROUP_HELP: Record<string, string[]> = {
   config: ["config show", "config profiles"],
   diagnostics: ["doctor", "diagnostics request", "diagnostics deliveries-summary"],
   entities: ["entities resolve"],
-  factors: ["factors exposures", "factors valuations"],
+  factors: ["factors exposures", "factors valuations", "factors macro-sensitivity"],
   filings: ["filings search", "filings latest"],
-  macro: ["macro search", "macro indicators", "macro high-signal-pack", "macro releases", "macro calendar", "macro forecasts", "macro regimes", "macro credit-ratings", "macro credit-rating"],
+  macro: ["macro search", "macro indicators", "macro high-signal-pack", "macro status", "macro country-report", "macro releases", "macro calendar", "macro forecasts", "macro regimes", "macro credit-ratings", "macro credit-rating"],
   mcp: ["mcp install"],
   limits: ["limits show"],
-  portfolio: ["portfolio analyze"],
+  portfolio: ["portfolio analyze", "portfolio stress-test", "portfolio stress-scenarios"],
   search: ["search fulltext", "search semantic"],
   sections: ["sections get"],
   setup: ["init", "mcp install", "agent-context", "examples", "completion"],
   statements: ["statements get"],
-  support: ["support bundle"],
   traces: ["traces get", "traces list"],
   usage: ["usage show"],
 }
@@ -1664,6 +1695,7 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "factors extreme-moves",
   "factors extreme-pairs",
   "factors history",
+  "factors macro-sensitivity",
   "factors pair-history",
   "factors pairs",
   "factors regime-performance",
@@ -1694,9 +1726,11 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "macro forecasts",
   "macro high-signal-pack",
   "macro indicators",
+  "macro country-report",
   "macro regimes",
   "macro releases",
   "macro search",
+  "macro status",
   "mcp install",
   "me",
   "model-portfolios factor-view",
@@ -1712,6 +1746,7 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "portfolio hedge",
   "portfolio optimize",
   "portfolio stress-test",
+  "portfolio stress-scenarios",
   "search fulltext",
   "search semantic",
   "sections get",
@@ -1723,7 +1758,6 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "streams create",
   "streams events",
   "streams list",
-  "support bundle",
   "traces get",
   "traces list",
   "usage show",
@@ -2049,7 +2083,6 @@ const STRICT_OPTION_COMMANDS = new Set([
   "limits show",
   "mcp install",
   "me",
-  "support bundle",
   "traces get",
   "traces list",
   "usage show",
@@ -2169,7 +2202,14 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "intelligence security": { requiredFlags: ["--ticker|--cik"], examples: ["secapi intelligence security --ticker AAPL --view compact"] },
   "limits show": { output: "human_or_json", examples: ["secapi limits show", "secapi limits show --json=false"] },
   "macro search": { requiredFlags: ["--q|--query"], examples: ["secapi macro search --q inflation --country US"] },
-  "macro indicators": { requiredFlags: ["--indicator|--indicator-key"], examples: ["secapi macro indicators --country US --indicator CPIAUCSL"] },
+  "macro indicators": { requiredFlags: ["--indicator|--indicator-key"], examples: ["secapi macro indicators --country US --indicator CPIAUCSL --response-mode compact"] },
+  "macro high-signal-pack": { examples: ["secapi macro high-signal-pack --country US", "secapi macro high-signal-pack --country US --response-mode standard --include series,trust"] },
+  "macro status": { examples: ["secapi macro status --country US --response-mode compact"] },
+  "macro country-report": { examples: ["secapi macro country-report --country US", "secapi macro country-report --country JP --symbols TM,SONY --response-mode compact"] },
+  "macro releases": { examples: ["secapi macro releases --country US --status released --limit 10"] },
+  "macro calendar": { examples: ["secapi macro calendar --country US --days 30 --limit 12 --response-mode compact"] },
+  "macro forecasts": { examples: ["secapi macro forecasts --country US --horizons 2 --response-mode compact"] },
+  "macro regimes": { examples: ["secapi macro regimes --country US --lookback 18m --response-mode compact"] },
   "macro credit-ratings": { examples: ["secapi macro credit-ratings --country US"] },
   "macro credit-rating": { requiredFlags: ["--country"], examples: ["secapi macro credit-rating --country US"] },
   me: { output: "human_or_json", examples: ["secapi me", "secapi me --json=false"] },
@@ -2183,6 +2223,8 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "portfolio hedge": { requiredFlags: ["--holdings-json|--holdings-file"], examples: ["secapi portfolio hedge --holdings-file holdings.json --objective factor_neutral"] },
   "portfolio optimize": { requiredFlags: ["--holdings-json|--holdings-file"], examples: ["secapi portfolio optimize --holdings-file holdings.json --objective min_drawdown"] },
   "portfolio stress-test": { requiredFlags: ["--holdings-json|--holdings-file"], examples: ["secapi portfolio stress-test --holdings-file holdings.json --scenario-key us_recession"] },
+  "portfolio stress-scenarios": { examples: ["secapi portfolio stress-scenarios --country US"] },
+  "factors macro-sensitivity": { examples: ["secapi factors macro-sensitivity --country US --scenario-key higher_for_longer --keys VALUE,QUALITY"] },
   "search fulltext": { requiredFlags: ["--q|--query"], examples: ["secapi search fulltext --q \"supply chain\" --form 10-K --limit 10"] },
   "search semantic": { requiredFlags: ["--q|--query"], examples: ["secapi search semantic --q \"supplier concentration\" --mode hybrid --view agent"] },
   "sections get": { requiredFlags: ["--ticker|--cik", "--section"], examples: ["secapi sections get --ticker AAPL --form 10-K --section item_1a --view agent"] },
@@ -2191,7 +2233,6 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "stocks loadings": { requiredFlags: ["--ticker"], examples: ["secapi stocks loadings --ticker AAPL --keys VALUE,QUALITY"] },
   "streams create": { mutates: true, examples: ["secapi streams create --event-types artifact.created --transport poll"] },
   "streams events": { requiredFlags: ["--stream-id"], examples: ["secapi streams events --stream-id strm_... --limit 10"] },
-  "support bundle": { auth: "optional_api_key", examples: ["secapi support bundle", "secapi support bundle --request-id req_..."] },
   "traces get": { requiredFlags: ["--trace-id"], examples: ["secapi traces get --trace-id trc_..."] },
   "traces list": { requiredFlags: ["--ids"], examples: ["secapi traces list --ids trc_1,trc_2"] },
   "usage show": { output: "human_or_json", examples: ["secapi usage show", "secapi usage show --json=false"] },
@@ -2553,7 +2594,7 @@ async function main() {
       ? {}
       : await resolveCredentials()
   const apiClient = defaultClient(credentials)
-  const anonymousClient = new SecApiClient({ baseUrl, fetch: captureFetch(), headers: cliHeaders() })
+  const anonymousClient = new SecApiClient({ baseUrl, fetch: captureFetch() })
 
   if (group === "health") {
     print(await apiClient.health())
@@ -2564,11 +2605,6 @@ async function main() {
     const report = await runDoctor(apiClient, credentials)
     print(report)
     if (!report.ok) process.exitCode = 1
-    return
-  }
-
-  if (group === "support" && command === "bundle") {
-    print(await runSupportBundle(apiClient, credentials))
     return
   }
 
@@ -3489,7 +3525,28 @@ async function main() {
   if (group === "macro" && command === "high-signal-pack") {
     print(await apiClient.macroHighSignalPack({
       country: getFlag("--country"),
+      ...macroResponseParams(),
     }))
+    return
+  }
+
+  if (group === "macro" && command === "status") {
+    print(await apiClient.macroStatus({
+      country: getFlag("--country"),
+      ...macroResponseParams(),
+    }))
+    return
+  }
+
+  if (group === "macro" && command === "country-report") {
+    print(await apiClient.macroInvestmentBriefing({
+      country: getFlag("--country") ?? "US",
+      lookback: getFlag("--lookback"),
+      symbols: getListFlag("--symbols") ?? getListFlag("--tickers"),
+      holdings: getArrayInput("--holdings-json", "--holdings-file", "holdings") as any,
+      horizon: getFlag("--horizon") as any,
+      briefingMode: (getFlag("--briefing-mode") ?? getFlag("--briefingMode")) as any,
+    }, macroResponseParams("compact")))
     return
   }
 
@@ -3497,6 +3554,7 @@ async function main() {
     print(await apiClient.macroRegimes({
       country: getFlag("--country"),
       lookback: getFlag("--lookback"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3508,6 +3566,7 @@ async function main() {
       country: getFlag("--country") ?? "US",
       indicator_key: indicatorKey,
       limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3516,7 +3575,10 @@ async function main() {
     print(await apiClient.macroReleases({
       country: getFlag("--country"),
       indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
+      status: getEnumFlag("--status", ["released", "scheduled"], "macro release status"),
+      days: getNumberFlag("--days"),
       limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3524,7 +3586,10 @@ async function main() {
   if (group === "macro" && command === "calendar") {
     print(await apiClient.macroCalendar({
       country: getFlag("--country"),
+      indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
       days: getNumberFlag("--days"),
+      limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3534,6 +3599,7 @@ async function main() {
       country: getFlag("--country"),
       indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
       horizons: getNumberFlag("--horizons"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3624,6 +3690,19 @@ async function main() {
       ticker: getFlag("--ticker"),
       portfolioId: getFlag("--portfolio-id"),
       keys: getListFlag("--keys"),
+      ...factorResponseParams(),
+    }))
+    return
+  }
+
+  if (group === "factors" && command === "macro-sensitivity") {
+    print(await apiClient.factorMacroSensitivity({
+      country: getFlag("--country"),
+      scenario_key: getPortfolioScenarioKeyFlag(),
+      keys: getListFlag("--keys") ?? getListFlag("--factors"),
+      indicators: getListFlag("--indicators"),
+      lookback: getFlag("--lookback"),
+      limit: getNumberFlag("--limit"),
       ...factorResponseParams(),
     }))
     return
@@ -3889,7 +3968,16 @@ async function main() {
     print(await apiClient.portfolioStressTest({
       ...portfolioWorkflowBody(),
       scenarioKey: getPortfolioScenarioKeyFlag(),
+      customScenario: getObjectInput("--scenario-json", "--scenario-file", "custom stress scenario") as any,
     }, factorResponseParams()))
+    return
+  }
+
+  if (group === "portfolio" && command === "stress-scenarios") {
+    print(await apiClient.portfolioStressScenarios({
+      country: getFlag("--country"),
+      ...factorResponseParams(),
+    }))
     return
   }
 
@@ -4099,7 +4187,7 @@ async function main() {
     const clients: Record<string, { kind: "command" } | FileSpec> = {
       "claude-code": { kind: "command" },
       "claude-desktop": { kind: "file", urlKey: "url", httpType: true, keyValue: literalKey, committable: false, path: claudeDesktopPath },
-      cursor: { kind: "file", urlKey: "url", httpType: false, keyValue: "${env:SECAPI_API_KEY}", committable: true, path: () => join(process.cwd(), ".cursor", "mcp.json") },
+      cursor: { kind: "file", urlKey: "url", httpType: false, keyValue: "${SECAPI_API_KEY}", committable: true, path: () => join(process.cwd(), ".cursor", "mcp.json") },
       windsurf: { kind: "file", urlKey: "serverUrl", httpType: false, keyValue: "${env:SECAPI_API_KEY}", committable: false, path: () => join(homedir(), ".codeium", "windsurf", "mcp_config.json") },
       project: { kind: "file", urlKey: "url", httpType: true, keyValue: "${SECAPI_API_KEY}", committable: true, path: () => join(process.cwd(), ".mcp.json") },
     }
@@ -4210,7 +4298,6 @@ async function main() {
     "",
     "Start here:",
     "  secapi doctor                         # diagnose base URL, auth, health, account, and MCP setup",
-    "  secapi support bundle                 # redacted packet for support tickets and agents",
     "  secapi examples                       # starter workflows for humans and agents",
     "  secapi agent-context                  # machine-readable command inventory for agents",
     "  secapi config show                    # local config/auth-source summary; no API request",
@@ -4267,7 +4354,6 @@ async function main() {
     "  secapi config show",
     "  secapi config profiles",
     "  secapi examples",
-    "  secapi support bundle --request-id req_...",
     "  secapi me",
     "  secapi org show",
     "  secapi billing show",
@@ -4375,10 +4461,10 @@ async function main() {
     "  secapi macro search --q inflation --country US",
     "  secapi macro high-signal-pack --country US",
     "  secapi macro regimes --country US --lookback 18m",
-    "  secapi macro indicators --country US --indicator CPIAUCSL",
-    "  secapi macro releases --country US",
-    "  secapi macro calendar --country US --days 30",
-    "  secapi macro forecasts --country US",
+    "  secapi macro indicators --country US --indicator CPIAUCSL --response-mode compact",
+    "  secapi macro releases --country US --status released",
+    "  secapi macro calendar --country US --days 30 --limit 12 --response-mode compact",
+    "  secapi macro forecasts --country US --response-mode compact",
     "  secapi macro credit-ratings --country US",
     "",
     "  # Factors",
