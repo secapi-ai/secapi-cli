@@ -20,15 +20,52 @@ SECAPI_API_KEY="$SECAPI_API_KEY" bun packages/cli/src/index.ts me --json=false
 printf "%s" "$SECAPI_API_KEY" | bun packages/cli/src/index.ts health --api-key-stdin
 ```
 
-Use the focused package checks before committing CLI changes:
+### Verify recipe (canonical gate)
+
+Every CLI change must pass this six-command gate before review and before a Draft
+PR is marked ready. Run it from the repo root:
 
 ```bash
-bun --filter @secapi/cli test
+bun install --frozen-lockfile
+bun --filter @secapi/cli test          # 128 black-box tests; the pipe-safe JSON contract
 bun --filter @secapi/cli typecheck
-bun run bench:cli-response-shape
-bun run smoke:cli-release
+bun run bench:cli-response-shape        # cold-start latency + stdout byte caps (runs the source file)
+bun run smoke:cli-release               # packs + installs the tarball; asserts zero runtime deps + both bins
 bun run scripts/validate/check_cli_doc_snippets.ts
 ```
+
+### Interactive TUI (Ink)
+
+Running `secapi` with no arguments in a real terminal (or `secapi chat` /
+`secapi tui`) opens an interactive session built with
+[Ink](https://github.com/vadimdemedes/ink) (React for CLIs) — *the trading desk
+in your terminal*. Piped, redirected, `--json`, CI, and dumb-terminal
+invocations keep the exact one-shot behavior, so agents and the gate above (all
+non-TTY) are unaffected.
+
+Inside the REPL:
+
+- **Type any command** without the `secapi` prefix (e.g. `filings latest --ticker AAPL`); results render as themed cards with an inline cost footer.
+- **`Tab`** opens a fuzzy command palette over all commands; **`shift+Tab`** cycles the run / plan / ask mode; **`↑/↓`** history; **`ctrl+l`** clear; **`ctrl+c`** aborts a running command then exits.
+- **Slash commands:** `/help` `/login` `/logout` `/whoami` `/status` `/cost` `/theme` `/config` `/skills` `/personas` `/prompts` `/export` `/resume` `/sessions` `/clear` `/quit`.
+- **Workflow shortcuts** (`/skills`): `/due-diligence AAPL`, `/analyze AAPL`, `/track-insiders AAPL`, `/factor-dashboard`, `/decompose AAPL`, `/footnotes AAPL`, `/factor-neutral`, `/regime-screen`, `/country-report US` — each expands the matching `@secapi/skills` workflow into a guided recipe of `secapi` commands (AI-metered steps flagged 💲).
+- **Live cost meter** in the status line (`◷ $0.04 · 18 calls · 61% cache`); `/cost` for the session total.
+- **Sessions** auto-save to `~/.config/secapi/sessions`; `/export [json|ndjson|md]`, `/resume`.
+
+Other surfaces:
+
+- **`secapi login`** verifies your key via `/v1/me` and saves a no-secret profile (it records *which env var* holds the key, never the value). `--print` previews without writing.
+- **`config theme [<name>]`** / `--theme <name>` / `--accent <#rrggbb>` — 6 themes (`terminal`, `lights-out`, `light`, `xai`, `daltonized`, `ansi`), honoring `NO_COLOR`/`FORCE_COLOR`/`COLORTERM`.
+- **`<command> --watch`** opens a live full-screen dashboard for watchable commands (`factors dashboard`, `factors extreme-moves`, `macro regimes`, `dilution score`, …); `--interval <seconds>`, `--once`. Non-TTY/`--json` run a single shot.
+- **`secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL"`** persists NL schedules (`schedule list`/`remove`/`run-due`) to wire into cron/launchd.
+
+Ink and React are **devDependencies only** — the build bundles them into the
+single `dist/index.js`, so the published package keeps `dependencies: {}` and
+installs instantly (the `smoke:cli-release` gate enforces this). The interactive
+code is reached via a dynamic `import()` so one-shot startup never pays
+React/Ink's cost. Test interactive components with Ink's injected-stream
+rendering (`render(tree, { stdout, stdin })`) — deterministic and PTY-free (no
+native `node-pty` dependency, which also keeps the API Docker image build clean).
 
 `bun run bench:cli-response-shape` exercises representative local-only help,
 example, config, and agent discovery commands with no credentials and fails if
@@ -102,7 +139,7 @@ secapi config profiles
 Two binaries are installed: the preferred `secapi` and the compatibility alias `omni-sec`.
 
 ```bash
-secapi --version   # prints the bare package version, e.g. 1.0.2
+secapi --version   # prints the bare package version, e.g. 1.1.0
 secapi --help      # short task-oriented help for common workflows
 secapi help all    # full command inventory
 secapi examples    # local starter workflows for humans and agents
@@ -133,7 +170,7 @@ secapi streams create --event-types artifact.created --transport poll --dry-run
 
 Supported dry-run previews: `api-keys create`, `billing budget`, `billing
 checkout`, `billing portal`, `webhooks create`, `webhooks rotate-secret`,
-`webhooks replay-delivery`, and `streams create`.
+`webhooks test`, `webhooks replay-delivery`, and `streams create`.
 
 Boolean flags accept bare flags plus explicit `true`, `false`, `yes`, `no`,
 `on`, `off`, `1`, and `0` values. Use `--include-v2=false` or `--print=false`
