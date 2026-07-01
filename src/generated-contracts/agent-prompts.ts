@@ -96,7 +96,7 @@ export const PERSONA_DISPLAY: Record<AgentPromptPersona, PersonaDisplayMeta> = {
     summary:
       "Forensic accounting and insider surveillance for activist, short-thesis, and prosumer analyst workflows.",
     framingNote:
-      "v1 framing: forensic accounting (footnote forensics + insider/13F divergence + cash-flow stress). v2 expansion adds dilution forensics (warrants, convertibles, ATM-program tracking, cash runway) as the API surface expands.",
+      "Forensic accounting workflows: footnote forensics, insider/13F divergence, and cash-flow stress.",
   },
   insurance: {
     displayName: "Insurance & risk",
@@ -104,7 +104,7 @@ export const PERSONA_DISPLAY: Record<AgentPromptPersona, PersonaDisplayMeta> = {
     summary:
       "D&O underwriting profile, auditor-change detection, material-weakness scans, and renewal-book monitoring for risk and underwriting teams.",
     framingNote:
-      "v1 framing: D&O profile via comp/13F/insider stack + keyword-search auditor changes + semantic material-weakness. v2 expansion adds typed AAER enrichment, typed auditor-change events, Form 144 monitoring, and subsidiaries discovery once supporting MCP tools merge.",
+      "D&O risk workflows: D&O profile via comp/13F/insider stack, keyword-search auditor changes, and semantic material-weakness detection.",
   },
   "pr-firm": {
     displayName: "PR firm",
@@ -148,7 +148,7 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     prompt:
       "For Berkshire Hathaway (CIK 0001067983), pull the latest 13F holdings, compare against the previous quarter, surface the top ten new positions, top ten exits, and top ten size changes. For each surfaced ticker, fetch the latest insider transactions to triangulate manager conviction. Output a markdown table with ticker, position delta (shares + dollars), insider-buy ratio, and a one-line interpretation per row.",
     expectedToolChain: [
-      { tool: "entities.resolve", purpose: "Canonicalize the holder identifier", exampleArgs: { cik: "0001067983" } },
+      { tool: "entities.resolve", purpose: "Resolve the holder identifier to a best-match entity", exampleArgs: { cik: "0001067983" } },
       { tool: "owners.get_13f", purpose: "Latest holdings snapshot", exampleArgs: { cik: "0001067983", limit: 50 } },
       { tool: "owners.compare_13f", purpose: "Quarter-over-quarter delta", exampleArgs: { cik: "0001067983" } },
       { tool: "insiders.list", purpose: "Cross-validate with insider activity per surfaced ticker", exampleArgs: { ticker: "AAPL", limit: 10 } },
@@ -205,7 +205,7 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     prompt:
       "For AAPL ahead of next earnings, pull the consensus estimates, the trailing four quarters of income statement, and the most recent MD&A section from the last 10-Q. Identify the three biggest estimate-vs-actual gaps from the prior quarter and surface MD&A passages that explain them. Output a one-page brief with bullets for setup, key debate, and watch-points.",
     expectedToolChain: [
-      { tool: "entities.resolve", purpose: "Resolve to canonical CIK", exampleArgs: { ticker: "AAPL" } },
+      { tool: "entities.resolve", purpose: "Resolve to best-match CIK", exampleArgs: { ticker: "AAPL" } },
       { tool: "market.estimates", purpose: "Analyst consensus estimates", exampleArgs: { ticker: "AAPL", limit: 10 } },
       { tool: "companies.income_statements", purpose: "Trailing four quarters", exampleArgs: { ticker: "AAPL", period: "quarterly", limit: 4 } },
       { tool: "sections.get", purpose: "Latest MD&A from 10-Q", exampleArgs: { ticker: "AAPL", form: "10-Q", sectionKey: "item_2" } },
@@ -224,7 +224,7 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     prompt:
       "For MSFT, pull five years of annual income statement, balance sheet, cash flow statement, and key ratios. Surface a year-over-year delta table for revenue, gross margin, operating margin, free cash flow, ROIC, and net debt/EBITDA. Highlight any year where two or more metrics inflected by more than 20 percent and ask the agent to hypothesize the driver.",
     expectedToolChain: [
-      { tool: "entities.resolve", purpose: "Resolve to canonical CIK", exampleArgs: { ticker: "MSFT" } },
+      { tool: "entities.resolve", purpose: "Resolve to best-match CIK", exampleArgs: { ticker: "MSFT" } },
       { tool: "companies.income_statements", purpose: "5-year income trend", exampleArgs: { ticker: "MSFT", period: "annual", limit: 5 } },
       { tool: "companies.cash_flow_statements", purpose: "5-year cash flow trend", exampleArgs: { ticker: "MSFT", period: "annual", limit: 5 } },
       { tool: "companies.ratios", purpose: "5-year ratios trend", exampleArgs: { ticker: "MSFT", period: "annual", limit: 5 } },
@@ -300,7 +300,7 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     prompt:
       "For META, pull the latest named-executive compensation disclosures and the prior year's compensation, compare year-over-year base + equity + total, then overlay trailing 12-month total shareholder return and the latest market financials. Output an alignment scorecard (0-10) with bullets on (a) pay-for-performance correlation, (b) equity grant timing relative to drawdowns, (c) any outlier comp items vs peers.",
     expectedToolChain: [
-      { tool: "entities.resolve", purpose: "Resolve to canonical CIK", exampleArgs: { ticker: "META" } },
+      { tool: "entities.resolve", purpose: "Resolve to best-match CIK", exampleArgs: { ticker: "META" } },
       { tool: "comp.list", purpose: "Latest named-executive comp", exampleArgs: { ticker: "META", limit: 10 } },
       { tool: "comp.compare", purpose: "Year-over-year comp comparison", exampleArgs: { ticker: "META", limit: 10 } },
       { tool: "market.financials", purpose: "TSR + price context", exampleArgs: { ticker: "META", timeframe: "annual", limit: 3 } },
@@ -319,7 +319,7 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     prompt:
       "For AMZN, pull the segment-revenue disclosure footnote (intelligence.footnotes topic=segment), align with the latest annual income statement segment columns, and walk five years of segment-mix shift. Surface the segment with the largest absolute growth, the segment with the largest margin compression, and the latest 10-K Item 8 segment table excerpt. Output a markdown narrative + segment-mix waterfall.",
     expectedToolChain: [
-      { tool: "entities.resolve", purpose: "Resolve to canonical CIK", exampleArgs: { ticker: "AMZN" } },
+      { tool: "entities.resolve", purpose: "Resolve to best-match CIK", exampleArgs: { ticker: "AMZN" } },
       { tool: "intelligence.footnotes", purpose: "Segment-disclosure footnotes", exampleArgs: { ticker: "AMZN", form: "10-K", topics: ["segment"] } },
       { tool: "companies.income_statements", purpose: "5-year segmented income", exampleArgs: { ticker: "AMZN", period: "annual", limit: 5 } },
       { tool: "sections.get", purpose: "Item 8 financial-statement segment narrative", exampleArgs: { ticker: "AMZN", form: "10-K", sectionKey: "item_8" } },
@@ -331,12 +331,12 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     id: "investment-manager-macro-tilt-recommendation",
     persona: "investment-manager",
     status: "v1",
-    title: "Recommend macro tilts based on cross-country regime divergence",
+    title: "Draft macro tilt scenarios based on cross-country regime divergence",
     category: "Macro overlay",
     oneLiner:
-      "Compare regimes across major markets and recommend country/factor tilts.",
+      "Compare regimes across major markets and draft country/factor tilt research scenarios.",
     prompt:
-      "Compare current macro regime classifications across US, Eurozone, Japan, and emerging markets. For each market, pull the latest high-signal indicator pack and the prevailing-regime factor returns. Recommend a country/factor tilt allocation with one paragraph of evidence per market. Output a tilt table + 4-paragraph rationale.",
+      "Compare current macro regime classifications across US, Eurozone, Japan, and emerging markets. For each market, pull the latest high-signal indicator pack and the prevailing-regime factor returns. Draft a country/factor tilt research scenario with one paragraph of evidence per market. Output a tilt table + 4-paragraph rationale.",
     expectedToolChain: [
       { tool: "macro.regimes", purpose: "Per-country regime classifications", exampleArgs: { country: "US", lookback: 252 } },
       { tool: "macro.indicators", purpose: "Recent indicator history per country", exampleArgs: { country: "US", indicatorKey: "industrial_production", limit: 12 } },
@@ -359,9 +359,9 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     oneLiner:
       "Compile 12 months of filings, legal proceedings, and insider activity for due diligence.",
     prompt:
-      "You are a legal research assistant with access to SEC API. For any client target company, resolve the entity to a canonical CIK, pull the past 12 months of filings (8-K, 10-K, 10-Q, DEF 14A), extract the legal-proceedings section (Item 3) from the most recent 10-K, list insider trading activity from the past 12 months, and surface any 8-K Item 5.02 (officer/director departures) events. Output a dossier with one section per finding category and inline requestId references for auditability.",
+      "You are a SEC filings research assistant with access to SEC API. For any client target company, resolve the entity to the best-match CIK, pull the past 12 months of filings (8-K, 10-K, 10-Q, DEF 14A), extract the legal-proceedings section (Item 3) from the most recent 10-K, list insider trading activity from the past 12 months, and surface any 8-K Item 5.02 (officer/director departures) events. Output a dossier with one section per finding category and inline requestId references for auditability.",
     expectedToolChain: [
-      { tool: "entities.resolve", purpose: "Canonicalize the target to a CIK", exampleArgs: { ticker: "WFC" } },
+      { tool: "entities.resolve", purpose: "Resolve the target to the best-match CIK", exampleArgs: { ticker: "WFC" } },
       { tool: "filings.search", purpose: "12-month filing history", exampleArgs: { ticker: "WFC", limit: 50 } },
       { tool: "sections.get", purpose: "Item 3 legal proceedings from latest 10-K", exampleArgs: { ticker: "WFC", form: "10-K", sectionKey: "item_3" } },
       { tool: "insiders.list", purpose: "12-month insider transaction history", exampleArgs: { ticker: "WFC", limit: 50 } },
@@ -425,7 +425,7 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     ],
     expectedOutput: "Severity-ranked table of restatements + material-weakness disclosures.",
     caveats: [
-      "Material-weakness detection is keyword-based on Item 9A text. Typed AAER classification ships in v2 with the AAER MCP wrap.",
+      "Material-weakness detection is keyword-based on Item 9A text.",
     ],
     difficulty: "advanced",
   },
@@ -495,14 +495,14 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     oneLiner:
       "Benchmark a client's Item 1A risk factors against factor-similar peers.",
     prompt:
-      "For NVDA, identify the top 10 factor-similar US peers, pull each peer's latest Item 1A (Risk Factors) section, and identify any risk-factor topics present in 7+ peers but missing from NVDA's disclosure. Output a comparison matrix + recommended risk-factor additions for the next 10-K cycle.",
+      "For NVDA, identify the top 10 factor-similar US peers, pull each peer's latest Item 1A (Risk Factors) section, and identify any risk-factor topics present in 7+ peers but missing from NVDA's disclosure. Output a comparison matrix + draft risk-factor additions for the next 10-K cycle.",
     expectedToolChain: [
       { tool: "entities.resolve", purpose: "Resolve subject and peers", exampleArgs: { ticker: "NVDA" } },
       { tool: "factors.related_stocks", purpose: "Factor-similar peer set", exampleArgs: { symbol: "NVDA", limit: 10 } },
       { tool: "sections.get", purpose: "Item 1A from each peer's 10-K", exampleArgs: { ticker: "AMD", form: "10-K", sectionKey: "item_1a" } },
       { tool: "intelligence.query", purpose: "Surface common risk-factor topics across the cohort", exampleArgs: { query: "common risk factors semiconductor industry 10-K", entities: ["NVDA", "AMD", "INTC"] } },
     ],
-    expectedOutput: "Comparison matrix + recommended risk-factor additions.",
+    expectedOutput: "Comparison matrix + draft risk-factor additions.",
     difficulty: "advanced",
   },
   {
@@ -616,14 +616,14 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     oneLiner:
       "Sweep client portfolio 8-K filings for material-event disclosures.",
     prompt:
-      "For a portfolio of 25 PR clients, sweep the past 30 days of 8-K filings, search for any Item 8.01 (Other Events) disclosure that references a 'material' announcement, and pull the full text of each match. Output a daily monitoring digest with one paragraph per event and a recommended client-comms posture.",
+      "For a portfolio of 25 PR clients, sweep the past 30 days of 8-K filings, search for any Item 8.01 (Other Events) disclosure that references a 'material' announcement, and pull the full text of each match. Output a daily monitoring digest with one paragraph per event and a client-comms scenario.",
     expectedToolChain: [
-      { tool: "entities.resolve", purpose: "Resolve each client to canonical CIK", exampleArgs: { ticker: "DIS" } },
+      { tool: "entities.resolve", purpose: "Resolve each client to best-match CIK", exampleArgs: { ticker: "DIS" } },
       { tool: "filings.search", purpose: "Recent 8-K filings", exampleArgs: { ticker: "DIS", form: "8-K", limit: 20 } },
       { tool: "sections.search", purpose: "Find Item 8.01 material disclosures", exampleArgs: { form: "8-K", q: "material", limit: 20 } },
       { tool: "sections.get", purpose: "Extract full Item 8.01 text", exampleArgs: { ticker: "DIS", form: "8-K", sectionKey: "item_8_01" } },
     ],
-    expectedOutput: "Daily monitoring digest + recommended client-comms posture per event.",
+    expectedOutput: "Daily monitoring digest + client-comms scenario per event.",
     difficulty: "intermediate",
   },
   {
@@ -1075,7 +1075,7 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     ],
     expectedOutput: "D&O underwriting memo + scorecard + requestId citations.",
     caveats: [
-      "AAER (Accounting and Auditing Enforcement Releases) enrichment is keyword-search only in v1; typed AAER ships with the v2 backfill.",
+      "AAER (Accounting and Auditing Enforcement Releases) enrichment is keyword-search based.",
     ],
     difficulty: "intermediate",
   },
@@ -1097,7 +1097,7 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     ],
     expectedOutput: "Watchlist alert table ranked by claim-trigger likelihood.",
     caveats: [
-      "Keyword-search-based; typed auditor-change events ship with v2 backfill (typed audit-change MCP wrap).",
+      "Keyword-search-based auditor-change detection.",
     ],
     difficulty: "intermediate",
   },
@@ -1287,14 +1287,14 @@ export const AGENT_PROMPT_LIBRARY: readonly AgentPrompt[] = [
     oneLiner:
       "Pull subsidiaries graph for an insured to scope D&O coverage correctly.",
     prompt:
-      "For an insured, pull companies.subsidiaries for the full subsidiaries graph, cross-reference with filings.search for any subsidiary-level filings, and pull comp comparison context for the parent. Output a subsidiaries map + coverage-scope recommendation.",
+      "For an insured, pull companies.subsidiaries for the full subsidiaries graph, cross-reference with filings.search for any subsidiary-level filings, and pull comp comparison context for the parent. Output a subsidiaries map + coverage-scope scenario.",
     expectedToolChain: [
       { tool: "companies.subsidiaries", purpose: "Subsidiaries graph (FUTURE)", exampleArgs: { ticker: "WFC" } },
       { tool: "filings.search", purpose: "Subsidiary-level filings", exampleArgs: { ticker: "WFC", limit: 20 } },
       { tool: "entities.resolve", purpose: "Resolve subsidiary entities", exampleArgs: { ticker: "WFC" } },
       { tool: "comp.compare", purpose: "Parent comp comparison context", exampleArgs: { ticker: "WFC", limit: 10 } },
     ],
-    expectedOutput: "Subsidiaries map + coverage-scope recommendation.",
+    expectedOutput: "Subsidiaries map + coverage-scope scenario.",
     blockedBy: ["OMNI-3084"],
     difficulty: "intermediate",
   },

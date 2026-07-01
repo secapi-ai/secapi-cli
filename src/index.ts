@@ -12,11 +12,32 @@ import {
   type AgentPromptPersona,
 } from "./generated-contracts/agent-prompts.js"
 import { SecApiClient, type FactorApiResponseMode, type ResponseView } from "@secapi/sdk-js"
+import { buildCards } from "./render/cards.ts"
+import { buildLoginPlan, NO_KEY_MESSAGE } from "./auth/login.ts"
+import {
+  describeSpec,
+  isDue,
+  loadSchedules,
+  parseSchedule,
+  saveSchedules,
+  type ScheduledTask,
+} from "./schedule/schedule.ts"
+import { createRenderer, shouldRenderRich } from "./render/renderer.ts"
+import { buildRegistry, type CommandSpec } from "./registry/registry.ts"
+import { createSessionId } from "./session/session.ts"
+import { loadSettings, saveGlobalSettings, type Settings } from "./settings/settings.ts"
+import { createTheme, detectColorSupport, parseHexColor } from "./theme/theme.ts"
+import { THEME_NAMES, type ThemeName } from "./theme/themes.ts"
+import { shouldLaunchInteractive } from "./tui/launch.ts"
+import { decideWatch, isWatchable, resolveIntervalMs } from "./tui/watch.ts"
 
 let args = process.argv.slice(2)
 let baseUrl = "https://api.secapi.ai"
 let baseUrlArg: string | undefined
 let profileArg: string | undefined
+let configThemeArg: ThemeName | undefined
+let themeArg: ThemeName | undefined
+let accentArg: string | undefined
 const STDIN_FLAG_NAME = "--api-key-stdin"
 const STDIN_BEARER_FLAG_NAME = "--bearer-token-stdin"
 const REJECTED_CREDENTIAL_FLAGS = new Set(["--api-key", "--bearer-token"])
@@ -32,12 +53,32 @@ const BASE_URL_ENV_NAMES = ["SECAPI_BASE_URL", "SECAPI_API_BASE_URL", "OMNI_DATA
 const PROFILE_ENV_NAME = "SECAPI_PROFILE"
 const PROFILE_CONFIG_FILE_ENV_NAME = "SECAPI_CONFIG_FILE"
 
-// ANSI styling for human output. Gated by isTTY so pipes/redirects/CI emit plain text.
+// Appearance resolved once at startup from settings (~/.config/secapi +
+// project .secapi/), then a --theme/--accent session override, then the
+// terminal's detected color capability. detectColorSupport honors
+// NO_COLOR/FORCE_COLOR/COLORTERM/TERM — when it returns "none" (non-TTY without
+// FORCE_COLOR, or NO_COLOR set) every code is "", so piped/CI output stays
+// byte-identical to the legacy `TTY ? code : ""` behavior and the tests pass.
+const cliSettingsResult = loadSettings({ env: process.env, home: homedir(), cwd: process.cwd() })
+const cliSettings: Settings = cliSettingsResult.settings
+const colorSupport = detectColorSupport(process.env, process.stdout.isTTY === true)
+const startupThemeArg = peekStringFlag("--theme")
+const startupAccentArg = peekStringFlag("--accent")
+const startupTheme = startupThemeArg && THEME_NAMES.includes(startupThemeArg as ThemeName) ? startupThemeArg as ThemeName : cliSettings.theme
+const startupAccent = normalizedHexColor(startupAccentArg ?? cliSettings.accent ?? "")
+const activeTheme = createTheme({
+  name: startupTheme,
+  support: colorSupport,
+  accent: startupAccent ? parseHexColor(startupAccent) ?? undefined : undefined,
+})
+// ANSI styling for human output. Gated by color support so pipes/redirects/CI
+// emit plain text. Names kept for the ~40 existing call sites; CYAN is now the
+// themeable brand accent.
 const TTY = process.stdout.isTTY === true
-const BOLD = TTY ? "\x1b[1m" : ""
-const DIM = TTY ? "\x1b[2m" : ""
-const CYAN = TTY ? "\x1b[36m" : ""
-const RESET = TTY ? "\x1b[0m" : ""
+const BOLD = activeTheme.bold
+const DIM = activeTheme.dim
+const CYAN = activeTheme.accent
+const RESET = activeTheme.reset
 
 type CliExample = {
   id: string
@@ -69,7 +110,7 @@ const CLI_EXAMPLES: CliExample[] = [
   {
     id: "resolve-company",
     title: "Resolve a company",
-    goal: "Map a ticker to canonical SEC API entity metadata before choosing a filing or financial-data workflow.",
+    goal: "Map a ticker to best-match SEC API entity metadata before choosing a filing or financial-data workflow.",
     command: "secapi entities resolve --ticker AAPL",
     auth: "api_key",
     callsApi: true,
@@ -303,8 +344,18 @@ function formatPromptReadHuman(p: AgentPrompt) {
 }
 
 function getFlag(name: string) {
-  const index = args.indexOf(name)
-  return index >= 0 ? args[index + 1] : undefined
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === name) {
+      const value = args[index + 1]
+      return value && !value.startsWith("--") ? value : undefined
+    }
+    if (arg.startsWith(`${name}=`)) {
+      const value = arg.slice(name.length + 1)
+      return value || undefined
+    }
+  }
+  return undefined
 }
 
 function assertUniqueFlag(name: string) {
@@ -337,6 +388,67 @@ function getStringFlag(name: string) {
   return undefined
 }
 
+function peekStringFlag(name: string) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === name) {
+      const value = args[index + 1]
+      return value && !value.startsWith("--") ? value : undefined
+    }
+    if (arg.startsWith(`${name}=`)) {
+      const value = arg.slice(name.length + 1)
+      return value || undefined
+    }
+  }
+  return undefined
+}
+
+function normalizedHexColor(value: string | undefined) {
+  if (!value) return undefined
+  const hex = value.trim().replace(/^#/, "")
+  if (!parseHexColor(hex)) return undefined
+  return `#${hex.toLowerCase()}`
+}
+
+function validateThemeFlag(value: string | undefined) {
+  if (!value) return undefined
+  if (!THEME_NAMES.includes(value as ThemeName)) {
+    throw new Error(`Unknown theme "${value}". Available: ${THEME_NAMES.join(", ")}`)
+  }
+  return value as ThemeName
+}
+
+function validateAccentFlag(value: string | undefined) {
+  if (!value) return undefined
+  const normalized = normalizedHexColor(value)
+  if (!normalized) throw new Error("--accent must be a #rrggbb hex color")
+  return normalized
+}
+
+function peekStringFlagAfterCommand(commandParts: string[], name: string) {
+  let commandIndex = -1
+  for (let index = 0; index <= args.length - commandParts.length; index += 1) {
+    if (commandParts.every((part, offset) => args[index + offset] === part)) {
+      commandIndex = index
+      break
+    }
+  }
+  if (commandIndex < 0) return undefined
+
+  for (let index = commandIndex + commandParts.length; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === name) {
+      const value = args[index + 1]
+      return value && !value.startsWith("--") ? value : undefined
+    }
+    if (arg.startsWith(`${name}=`)) {
+      const value = arg.slice(name.length + 1)
+      return value || undefined
+    }
+  }
+  return undefined
+}
+
 function readBooleanFlag(name: string) {
   const values: string[] = []
   for (let index = 0; index < args.length; index += 1) {
@@ -356,6 +468,19 @@ function readBooleanFlag(name: string) {
   if (["1", "true", "yes", "on"].includes(normalized)) return true
   if (["0", "false", "no", "off"].includes(normalized)) return false
   throw new Error(`${name} must be true or false`)
+}
+
+function peekBooleanFlag(name: string) {
+  const value = peekStringFlag(name)
+  if (value === undefined) return args.includes(name) ? true : undefined
+  const normalized = value.trim().toLowerCase()
+  if (["1", "true", "yes", "on"].includes(normalized)) return true
+  if (["0", "false", "no", "off"].includes(normalized)) return false
+  return true
+}
+
+function hasRawFlag(name: string) {
+  return args.some((arg) => arg === name || arg.startsWith(`${name}=`))
 }
 
 function hasFlag(name: string) {
@@ -381,12 +506,35 @@ function writeOutput(value: string, options: { ensureTrailingNewline?: boolean }
   chmodSync(outputPath, 0o600)
 }
 
+// Single output chokepoint. JSON mode is byte-identical to the legacy
+// implementation (writeOutput(JSON.stringify(value, null, 2))). Rich, TTY-only
+// "cards" engage via renderer.resource() ONLY when shouldRenderRich is true
+// (a real TTY, not --json/--output/NO_COLOR), so no handler can leak decoration
+// into a pipe. Each card defers to JSON if the value's shape is unexpected.
+// SECAPI_TUI=1 is an internal hatch the interactive REPL sets when it re-spawns
+// the CLI to capture rich card output for a (non-TTY) child it renders itself.
+// It still honors machine-output flags: --json and --output disable cards even
+// inside the REPL. These non-throwing reads run before main() installs the error
+// formatter, so duplicate/invalid flags degrade to JSON here and are reported
+// cleanly later by readBooleanFlag()/outputPathFlag().
+const renderRich = shouldRenderRich({
+  isTty: process.env.SECAPI_TUI === "1" || process.stdout.isTTY === true,
+  jsonFlag: peekBooleanFlag("--json"),
+  hasOutputPath: hasRawFlag("--output"),
+  noColor: process.env.SECAPI_TUI === "1" ? false : process.env.NO_COLOR !== undefined,
+})
+const renderer = createRenderer({
+  write: (text) => writeOutput(text),
+  rich: renderRich,
+  cards: buildCards(activeTheme),
+})
+
 function print(value: unknown) {
-  writeOutput(JSON.stringify(value, null, 2))
+  renderer.json(value)
 }
 
 function printRaw(value: string) {
-  writeOutput(value)
+  renderer.raw(value)
 }
 
 function shouldPrintHumanSummary() {
@@ -810,6 +958,37 @@ function factorResponseParams() {
   }
 }
 
+type MacroCliResponseMode = "compact" | "standard" | "verbose" | "agent"
+
+function getMacroResponseModeFlag(name = "--response-mode"): MacroCliResponseMode | undefined {
+  const raw = getEnumFlag(name, ["compact", "standard", "verbose", "agent", "default"], "macro response mode")
+  return raw === "default" ? "standard" : raw
+}
+
+function getMacroViewResponseModeFlag(name = "--view"): MacroCliResponseMode | undefined {
+  const raw = getUniqueFlag(name)
+  if (raw === undefined) return undefined
+  const aliases: Record<string, MacroCliResponseMode> = {
+    agent: "agent",
+    compact: "compact",
+    default: "standard",
+    standard: "standard",
+    verbose: "verbose",
+  }
+  const normalized = raw.trim().toLowerCase()
+  const mapped = aliases[normalized]
+  if (mapped) return mapped
+  throw new Error(`${name} must be one of: default, agent, compact, standard, verbose (macro response view)`)
+}
+
+function macroResponseParams() {
+  const include = getListFlag("--include") ?? getListFlag("--expand")
+  return {
+    response_mode: getMacroResponseModeFlag("--response-mode") ?? getMacroViewResponseModeFlag("--view"),
+    include: include?.join(","),
+  }
+}
+
 function factorKeySelectionParams() {
   return {
     keys: getListFlag("--keys") ?? getListFlag("--factors"),
@@ -1037,6 +1216,30 @@ function profileFromRaw(name: string, raw: unknown, configPath: string) {
   }
 }
 
+// Secret-free profile writer used by `secapi login`. Persists only env-var NAMES
+// + baseUrl (validated to reject credential-shaped values), mode 0600. Merges
+// into any existing entry for the profile.
+function writeProfileEntry(name: string, entry: { baseUrl?: string | null; apiKeyEnv?: string; bearerTokenEnv?: string }) {
+  safeProfileName(name, "profile name")
+  const validated: Record<string, string> = {}
+  const apiKeyEnv = profileEnvName(entry.apiKeyEnv, "apiKeyEnv")
+  if (apiKeyEnv) validated.apiKeyEnv = apiKeyEnv
+  const bearerTokenEnv = profileEnvName(entry.bearerTokenEnv, "bearerTokenEnv")
+  if (bearerTokenEnv) validated.bearerTokenEnv = bearerTokenEnv
+  if (entry.baseUrl) validated.baseUrl = normalizeBaseUrlValue(entry.baseUrl, "Profile field baseUrl")
+  const { configPath, profiles } = readProfilesFile({ allowMissing: true })
+  const existing =
+    profiles[name] && typeof profiles[name] === "object" && !Array.isArray(profiles[name])
+      ? (profiles[name] as Record<string, unknown>)
+      : {}
+  profiles[name] = { ...existing, ...validated }
+  if (entry.baseUrl === null) delete (profiles[name] as Record<string, unknown>).baseUrl
+  mkdirSync(dirname(configPath), { recursive: true })
+  writeFileSync(configPath, `${JSON.stringify({ profiles }, null, 2)}\n`, { mode: 0o600 })
+  chmodSync(configPath, 0o600)
+  return configPath
+}
+
 function activeProfile(): CliProfile | undefined {
   const selected = activeProfileName()
   if (!selected) return undefined
@@ -1045,6 +1248,13 @@ function activeProfile(): CliProfile | undefined {
   safeProfileName(name, selected.source)
   const { configPath, profiles } = readProfilesFile()
   return profileFromRaw(name, profiles[name], configPath)
+}
+
+function existingProfile(name: string): CliProfile | undefined {
+  const { configPath, profiles } = readProfilesFile({ allowMissing: true })
+  const raw = profiles[name]
+  if (raw === undefined) return undefined
+  return profileFromRaw(name, raw, configPath)
 }
 
 function consumeGlobalStringArg(name: string) {
@@ -1070,15 +1280,15 @@ function consumeGlobalStringArg(name: string) {
   return values[0]
 }
 
-function resolveBaseUrl() {
-  return normalizeBaseUrlValue(baseUrlConfigSource().value)
+function resolveBaseUrl(options?: { profile?: CliProfile | null }) {
+  return normalizeBaseUrlValue(baseUrlConfigSource(options).value)
 }
 
-function baseUrlConfigSource() {
+function baseUrlConfigSource(options?: { profile?: CliProfile | null }) {
   if (baseUrlArg) return { type: "flag", source: "--base-url", value: baseUrlArg }
   const envSource = envCredentialWithSource(...BASE_URL_ENV_NAMES)
   if (envSource) return { type: "env", source: envSource.source, value: envSource.value }
-  const profile = activeProfile()
+  const profile = options && "profile" in options ? options.profile : activeProfile()
   if (profile?.baseUrl) return { type: "profile", source: profile.name, value: profile.baseUrl }
   return { type: "default", source: "default", value: "https://api.secapi.ai" }
 }
@@ -1218,7 +1428,6 @@ function defaultClient(credentials: CliCredentials) {
     bearerToken: credentials.bearerToken,
     baseUrl,
     fetch: captureFetch(),
-    headers: cliHeaders(),
   })
 }
 
@@ -1231,12 +1440,7 @@ function humanClient(credentials: CliCredentials) {
     bearerToken,
     baseUrl,
     fetch: captureFetch(),
-    headers: cliHeaders(),
   })
-}
-
-function cliHeaders() {
-  return { "user-agent": `secapi-cli/${cliVersion()}` }
 }
 
 function sanitizeDiagnosticText(value: string, credentials: CliCredentials) {
@@ -1245,10 +1449,31 @@ function sanitizeDiagnosticText(value: string, credentials: CliCredentials) {
     if (!secret) continue
     out = out.split(secret).join("[redacted]")
   }
+  out = out
+    .replace(/\b(?:secapi_(?:live|test)|secapi_boot|ods_(?:live|test))_[A-Za-z0-9._~-]{8,}\b/g, "[redacted]")
+    .replace(/\bopr_(?:live|test)_[A-Za-z0-9._~-]{8,}\b/g, "[redacted]")
+    .replace(/\bbearer_[A-Za-z0-9._~-]{8,}\b/g, "[redacted]")
+    .replace(/\bagbt_[A-Za-z0-9._~-]{8,}\b/g, "[redacted]")
+    .replace(/\bwhsec_[A-Za-z0-9._~-]{8,}\b/g, "[redacted]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[redacted]")
   return out
-    .replace(/\b(?:secapi|opr|ods)_(?:live|test|prod|dev|boot)_[A-Za-z0-9._-]+\b/gi, "[redacted]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+\b/g, "Bearer [redacted]")
-    .replace(/\bbearer[_-][A-Za-z0-9._-]+\b/gi, "[redacted]")
+}
+
+function isSensitiveDiagnosticKey(key: string) {
+  const normalized = key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase()
+  if (normalized === "tokencount" || normalized === "tokencountsource") return false
+  return [
+    "authorization",
+    "apikey",
+    "bearertoken",
+    "password",
+    "secret",
+    "accesskey",
+    "accesstoken",
+    "refreshtoken",
+    "sessiontoken",
+    "webhooksecret",
+  ].some((part) => normalized.includes(part))
 }
 
 function diagnosticError(error: unknown, credentials: CliCredentials) {
@@ -1263,13 +1488,15 @@ function diagnosticError(error: unknown, credentials: CliCredentials) {
   }
 }
 
-function sanitizeDiagnosticValue(value: unknown, credentials: CliCredentials): unknown {
-  if (typeof value === "string") return sanitizeDiagnosticText(value, credentials)
-  if (Array.isArray(value)) return value.map((entry) => sanitizeDiagnosticValue(entry, credentials))
+function redactDiagnosticValue(value: unknown, credentials: CliCredentials, key?: string): unknown {
+  if (typeof value === "string") {
+    return key && isSensitiveDiagnosticKey(key) ? "[redacted]" : sanitizeDiagnosticText(value, credentials)
+  }
+  if (Array.isArray(value)) return value.map((entry) => redactDiagnosticValue(entry, credentials, key))
   if (!value || typeof value !== "object") return value
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
-      .map(([key, entry]) => [sanitizeDiagnosticText(key, credentials), sanitizeDiagnosticValue(entry, credentials)]),
+      .map(([entryKey, entry]) => [entryKey, redactDiagnosticValue(entry, credentials, entryKey)]),
   )
 }
 
@@ -1285,39 +1512,27 @@ async function doctorCheck(fn: () => Promise<unknown>, credentials: CliCredentia
 }
 
 async function runSupportBundle(apiClient: SecApiClient, credentials: CliCredentials) {
-  const requestId = getStringFlag("--request-id")
+  const requestId = getFlag("--request-id")
   const doctor = await runDoctor(apiClient, credentials)
-  const requestDiagnostics = requestId
+  const request = requestId
     ? await doctorCheck(() => apiClient.requestDiagnostics(requestId), credentials)
     : {
         ok: null,
         skipped: true,
-        reason: "Pass --request-id <Request-Id> to include request-scoped diagnostics.",
+        reason: "Pass --request-id req_... to include request diagnostics.",
       }
-  const bundle = {
-    object: "secapi_cli_support_bundle",
-    schemaVersion: 1,
+
+  return redactDiagnosticValue({
+    object: "secapi_support_bundle",
+    cliVersion: cliVersion(),
     generatedAt: new Date().toISOString(),
-    cli: {
-      version: cliVersion(),
-      binaries: ["secapi", "omni-sec"],
-    },
-    runtime: {
-      node: process.version,
-      platform: process.platform,
-      arch: process.arch,
-    },
-    config: localConfigReport(),
+    baseUrl,
+    localConfig: localConfigReport(),
     doctor,
-    requestDiagnostics,
-    requestSummary: requestSummaries,
-    redaction: {
-      credentialValuesIncluded: false,
-      credentialSourcesOnly: true,
-      note: "Credential values and echoed credential strings are redacted before output.",
-    },
-  }
-  return sanitizeDiagnosticValue(bundle, credentials)
+    requestId: requestId ?? null,
+    request,
+    note: "Credential values are redacted recursively. Preserve requestId and traceparent when sharing this bundle with support.",
+  }, credentials)
 }
 
 async function runDoctor(apiClient: SecApiClient, credentials: CliCredentials) {
@@ -1391,11 +1606,11 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     summary: "Run safe CLI diagnostics for base URL, auth, health, account context, and hosted MCP setup.",
     examples: ["secapi doctor"],
   },
-  "support bundle": {
-    usage: "secapi support bundle [--request-id <request_id>]",
-    summary: "Print a redacted support packet with local config, doctor checks, request summaries, and optional request diagnostics.",
-    flags: ["--request-id <request_id>", "--output <file>"],
-    examples: ["secapi support bundle", "secapi support bundle --request-id req_..."],
+  login: {
+    usage: "secapi login [--profile <name>] [--print]",
+    summary: "Verify your API key and save a no-secret profile that records WHICH env var holds it. Never stores the key.",
+    flags: ["--profile <name>", "--base-url <url>", "--print", STDIN_FLAG_NAME],
+    examples: ["secapi login", "secapi login --print", "secapi --profile prod login"],
   },
   me: {
     usage: "secapi me",
@@ -1421,6 +1636,12 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     flags: ["--json=false", "--request-summary", "--output <file>"],
     examples: ["secapi limits show", "secapi limits show --json=false"],
   },
+  "support bundle": {
+    usage: "secapi support bundle [--request-id <request_id>]",
+    summary: "Emit a redacted support bundle with local config, doctor checks, and optional request diagnostics.",
+    flags: ["--request-id <request_id>", "--output <file>"],
+    examples: ["secapi support bundle", "secapi support bundle --request-id req_..."],
+  },
   "macro search": {
     usage: "secapi macro search --q <query> [--country <country>] [--limit <n>]",
     summary: "Search macro indicator keys before fetching observations, releases, forecasts, or country reports.",
@@ -1428,10 +1649,40 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     examples: ["secapi macro search --q inflation --country US --limit 10"],
   },
   "macro indicators": {
-    usage: "secapi macro indicators --indicator <key> [--country <country>]",
+    usage: "secapi macro indicators --indicator <key> [--country <country>] [--response-mode compact|standard|verbose|agent]",
     summary: "Fetch macro observations for one country and indicator key.",
-    flags: ["--indicator <key>", "--indicator-key <key>", "--country <country>", "--limit <n>"],
-    examples: ["secapi macro indicators --country US --indicator CPIAUCSL --limit 12"],
+    flags: ["--indicator <key>", "--indicator-key <key>", "--country <country>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro indicators --country US --indicator CPIAUCSL --limit 12 --response-mode compact"],
+  },
+  "macro high-signal-pack": {
+    usage: "secapi macro high-signal-pack [--country <country>] [--response-mode compact|standard|verbose|agent]",
+    summary: "Fetch the compact high-signal macro pack for a country, with expansion controls for full series and trust metadata.",
+    flags: ["--country <country>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro high-signal-pack --country US", "secapi macro high-signal-pack --country US --response-mode standard --include series,trust"],
+  },
+  "macro releases": {
+    usage: "secapi macro releases [--country <country>] [--status released|scheduled] [--limit <n>]",
+    summary: "Fetch released macro history by default, or upcoming scheduled events with --status scheduled.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--status <released|scheduled>", "--days <n>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro releases --country US --status released --limit 10", "secapi macro releases --country US --status scheduled --days 45 --response-mode compact"],
+  },
+  "macro calendar": {
+    usage: "secapi macro calendar [--country <country>] [--days <n>] [--limit <n>]",
+    summary: "Fetch upcoming scheduled macro releases only.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--days <n>", "--limit <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro calendar --country US --days 30 --limit 12 --response-mode compact"],
+  },
+  "macro forecasts": {
+    usage: "secapi macro forecasts [--country <country>] [--indicator <key>] [--horizons <n>]",
+    summary: "Fetch compact baseline macro forecasts; country-wide calls default to compact at the API.",
+    flags: ["--country <country>", "--indicator <key>", "--indicator-key <key>", "--horizons <n>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro forecasts --country US --horizons 2 --response-mode compact"],
+  },
+  "macro regimes": {
+    usage: "secapi macro regimes [--country <country>] [--lookback <window>]",
+    summary: "Fetch the current macro regime classification as a list envelope.",
+    flags: ["--country <country>", "--lookback <window>", "--response-mode <mode>", "--view <mode>", "--include <fields>", "--expand <fields>"],
+    examples: ["secapi macro regimes --country US --lookback 18m --response-mode compact"],
   },
   "macro credit-ratings": {
     usage: "secapi macro credit-ratings [--country <country>]",
@@ -1447,7 +1698,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
   },
   "entities resolve": {
     usage: "secapi entities resolve --ticker <symbol> | --cik <cik> | --query <name>",
-    summary: "Resolve ticker, CIK, or company name to canonical SEC API entity metadata.",
+    summary: "Resolve ticker, CIK, or company name to best-match SEC API entity metadata.",
     flags: ["--ticker <symbol>", "--cik <cik>", "--query <name>"],
     examples: ["secapi entities resolve --ticker AAPL"],
   },
@@ -1551,6 +1802,30 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     flags: ["--profile <name>", "--output <file>"],
     examples: ["secapi config profiles", "secapi --profile local config profiles"],
   },
+  "config theme": {
+    usage: "secapi config theme [<name>] [--theme <name>] [--accent <#rrggbb>]",
+    summary: "Show the active CLI theme or persist a named palette to ~/.config/secapi/settings.json. Local-only.",
+    flags: ["--json"],
+    examples: [
+      "secapi config theme",
+      "secapi config theme xai",
+      "secapi config theme --theme xai --accent #ff6308",
+      "secapi config theme --json",
+    ],
+  },
+  "schedule add": {
+    usage: 'secapi schedule add --when "<natural language>" --run "<command>"',
+    summary: "Schedule a secapi command in natural language (local; run via cron/launchd → schedule run-due).",
+    flags: ["--when <text>", "--run <command>"],
+    examples: ['secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL"'],
+  },
+  "schedule list": { usage: "secapi schedule list", summary: "List scheduled commands.", examples: ["secapi schedule list"] },
+  "schedule remove": { usage: "secapi schedule remove <id>", summary: "Remove a scheduled command.", examples: ["secapi schedule remove sch_..."] },
+  "schedule run-due": {
+    usage: "secapi schedule run-due",
+    summary: "List schedules due now (wire into cron/launchd). Local-only.",
+    examples: ["secapi schedule run-due"],
+  },
   init: {
     usage: "secapi init --client <claude-code|claude-desktop|cursor|windsurf|project> [--print]",
     summary: "Write or print the hosted-MCP config for an agent client.",
@@ -1567,12 +1842,21 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     usage: "secapi agent-context",
     summary: "Emit machine-readable CLI discovery metadata for coding agents.",
   },
+  chat: {
+    usage: "secapi chat",
+    summary: "Open the interactive SEC API terminal REPL.",
+  },
+  tui: {
+    usage: "secapi tui",
+    summary: "Open the interactive SEC API terminal REPL.",
+  },
 }
 
 const GROUP_HELP: Record<string, string[]> = {
   agents: ["agents personas", "agents prompts"],
   billing: ["billing show", "billing quote", "billing budget", "billing checkout", "billing portal"],
-  config: ["config show", "config profiles"],
+  config: ["config show", "config profiles", "config theme"],
+  schedule: ["schedule add", "schedule list", "schedule remove", "schedule run-due"],
   diagnostics: ["doctor", "diagnostics request", "diagnostics deliveries-summary"],
   entities: ["entities resolve"],
   factors: ["factors exposures", "factors valuations"],
@@ -1628,6 +1912,7 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "completion",
   "config profiles",
   "config show",
+  "config theme",
   "dashboard overview",
   "diagnostics deliveries-summary",
   "diagnostics request",
@@ -1688,6 +1973,11 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "intelligence footnotes-query",
   "intelligence security",
   "limits show",
+  "login",
+  "schedule add",
+  "schedule list",
+  "schedule remove",
+  "schedule run-due",
   "macro calendar",
   "macro credit-rating",
   "macro credit-ratings",
@@ -1720,10 +2010,10 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "stocks loadings",
   "strategies factor-rotation",
   "strategies regime-screen",
+  "support bundle",
   "streams create",
   "streams events",
   "streams list",
-  "support bundle",
   "traces get",
   "traces list",
   "usage show",
@@ -1925,7 +2215,14 @@ function printCommandHelp(key: string, help: CommandHelp) {
   }
   if (key === "doctor") {
     lines.push("", "Authentication: optional. Set SECAPI_API_KEY or pipe through --api-key-stdin to verify account context.")
-  } else if (!["agent-context", "completion", "config profiles", "config show", "examples", "health"].includes(key)) {
+  } else if (key === "config theme") {
+    lines.push(
+      "",
+      "Persistence: pass a theme name (<name>) or --theme on this command to write ~/.config/secapi/settings.json.",
+      "Optional --accent #rrggbb is saved with the theme.",
+      "A global --theme before other commands applies for that run only; prefixing config theme does not save settings.",
+    )
+  } else if (!["agent-context", "completion", "config profiles", "config show", "config theme", "examples", "health", "login", "schedule add", "schedule list", "schedule remove", "schedule run-due"].includes(key)) {
     lines.push("", "Authentication: set SECAPI_API_KEY, SECAPI_OPERATOR_API_KEY, SECAPI_BEARER_TOKEN, or use a documented stdin credential flag when the command calls the API.")
   }
   process.stdout.write(`${lines.join("\n")}\n`)
@@ -2024,6 +2321,11 @@ const GLOBAL_OPTION_FLAGS = new Set([
   "--output",
   "--profile",
   "--request-summary",
+  "--theme",
+  "--accent",
+  "--watch",
+  "--once",
+  "--interval",
 ])
 
 function optionFlagsFromText(value: string) {
@@ -2042,6 +2344,7 @@ const STRICT_OPTION_COMMANDS = new Set([
   "completion",
   "config profiles",
   "config show",
+  "config theme",
   "doctor",
   "examples",
   "health",
@@ -2049,7 +2352,6 @@ const STRICT_OPTION_COMMANDS = new Set([
   "limits show",
   "mcp install",
   "me",
-  "support bundle",
   "traces get",
   "traces list",
   "usage show",
@@ -2139,6 +2441,11 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   completion: { auth: "none", output: "text", examples: ["secapi completion zsh"] },
   "config profiles": { auth: "none", output: "json", examples: ["secapi config profiles", "secapi --profile local config profiles"] },
   "config show": { auth: "none", examples: ["secapi config show", "secapi --profile local config show", "secapi --base-url http://127.0.0.1:8787 config show"] },
+  "config theme": {
+    auth: "none",
+    output: "human_or_json",
+    examples: ["secapi config theme", "secapi config theme xai", "secapi config theme xai --accent #ff6308"],
+  },
   examples: { auth: "none", output: "human_or_json", examples: ["secapi examples", "secapi examples --json=false"] },
   "diagnostics request": { requiredFlags: ["--request-id"], examples: ["secapi diagnostics request --request-id req_..."] },
   doctor: { auth: "optional_api_key", examples: ["secapi doctor"] },
@@ -2162,6 +2469,11 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "filings search": { examples: ["secapi filings search --ticker AAPL --form 10-K --limit 5"] },
   "facts get": { requiredFlags: ["--tag"], examples: ["secapi facts get --ticker AAPL --tag Revenues --taxonomy us-gaap"] },
   health: { auth: "none", examples: ["secapi health"] },
+  login: { auth: "optional_api_key", mutates: true, output: "json", examples: ["secapi login", "secapi login --print"] },
+  "schedule add": { auth: "none", mutates: true, output: "json", requiredFlags: ["--when", "--run"], examples: ['secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL"'] },
+  "schedule list": { auth: "none", output: "json", examples: ["secapi schedule list"] },
+  "schedule remove": { auth: "none", mutates: true, output: "json", examples: ["secapi schedule remove sch_..."] },
+  "schedule run-due": { auth: "none", output: "json", examples: ["secapi schedule run-due"] },
   init: { auth: "optional_api_key", mutates: true, output: "file_or_text", requiredFlags: ["--client"], examples: ["secapi init --client cursor --print"] },
   "intelligence company": { requiredFlags: ["--ticker|--cik"], examples: ["secapi intelligence company --ticker AAPL --view compact"] },
   "intelligence earnings-preview": { requiredFlags: ["--ticker|--cik"], examples: ["secapi intelligence earnings-preview --ticker AAPL --view compact"] },
@@ -2169,7 +2481,12 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "intelligence security": { requiredFlags: ["--ticker|--cik"], examples: ["secapi intelligence security --ticker AAPL --view compact"] },
   "limits show": { output: "human_or_json", examples: ["secapi limits show", "secapi limits show --json=false"] },
   "macro search": { requiredFlags: ["--q|--query"], examples: ["secapi macro search --q inflation --country US"] },
-  "macro indicators": { requiredFlags: ["--indicator|--indicator-key"], examples: ["secapi macro indicators --country US --indicator CPIAUCSL"] },
+  "macro indicators": { requiredFlags: ["--indicator|--indicator-key"], examples: ["secapi macro indicators --country US --indicator CPIAUCSL --response-mode compact"] },
+  "macro high-signal-pack": { examples: ["secapi macro high-signal-pack --country US", "secapi macro high-signal-pack --country US --response-mode standard --include series,trust"] },
+  "macro releases": { examples: ["secapi macro releases --country US --status released --limit 10"] },
+  "macro calendar": { examples: ["secapi macro calendar --country US --days 30 --limit 12 --response-mode compact"] },
+  "macro forecasts": { examples: ["secapi macro forecasts --country US --horizons 2 --response-mode compact"] },
+  "macro regimes": { examples: ["secapi macro regimes --country US --lookback 18m --response-mode compact"] },
   "macro credit-ratings": { examples: ["secapi macro credit-ratings --country US"] },
   "macro credit-rating": { requiredFlags: ["--country"], examples: ["secapi macro credit-rating --country US"] },
   me: { output: "human_or_json", examples: ["secapi me", "secapi me --json=false"] },
@@ -2189,9 +2506,9 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "sections search": { requiredFlags: ["--q|--query"], examples: ["secapi sections search --ticker AAPL --q risk --form 10-K"] },
   "statements get": { requiredFlags: ["--ticker|--cik"], examples: ["secapi statements get --ticker AAPL --statement all --period annual --limit 1"] },
   "stocks loadings": { requiredFlags: ["--ticker"], examples: ["secapi stocks loadings --ticker AAPL --keys VALUE,QUALITY"] },
+  "support bundle": { mutates: false, examples: ["secapi support bundle --request-id req_..."] },
   "streams create": { mutates: true, examples: ["secapi streams create --event-types artifact.created --transport poll"] },
   "streams events": { requiredFlags: ["--stream-id"], examples: ["secapi streams events --stream-id strm_... --limit 10"] },
-  "support bundle": { auth: "optional_api_key", examples: ["secapi support bundle", "secapi support bundle --request-id req_..."] },
   "traces get": { requiredFlags: ["--trace-id"], examples: ["secapi traces get --trace-id trc_..."] },
   "traces list": { requiredFlags: ["--ids"], examples: ["secapi traces list --ids trc_1,trc_2"] },
   "usage show": { output: "human_or_json", examples: ["secapi usage show", "secapi usage show --json=false"] },
@@ -2244,6 +2561,89 @@ function agentContextCommandGroups() {
   return [...groups.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([group, { commands, details }]) => ({ group, commands, details }))
+}
+
+// Command registry — the queryable source of truth derived from the SAME
+// metadata that powers agent-context, so they can never drift. The interactive
+// palette (Phase 5) and the strangler migration of handler bodies (later in
+// Phase 1) both consume this. Building it from `agentContextCommandDetail`
+// guarantees consistency with `secapi agent-context`.
+function commandSpecFor(commandKey: string): CommandSpec {
+  const detail = agentContextCommandDetail(commandKey)
+  const group = commandKey.includes(" ") ? commandKey.slice(0, commandKey.indexOf(" ")) : "root"
+  return {
+    key: commandKey,
+    group,
+    command: detail.command,
+    usage: detail.usage,
+    auth: detail.auth,
+    mutates: detail.mutates,
+    output: detail.output,
+    requiredFlags: detail.requiredFlags,
+    examples: detail.examples,
+  }
+}
+
+const commandRegistry = buildRegistry([...IMPLEMENTED_COMMAND_KEYS].map(commandSpecFor))
+
+// `config theme` — local-only appearance control. Shows the active theme (or
+// sets and persists it to ~/.config/secapi/settings.json). Never calls the API.
+function localThemeReport() {
+  return {
+    object: "secapi_cli_theme",
+    theme: activeTheme.name,
+    accent: validateAccentFlag(accentArg) ?? startupAccent ?? null,
+    colorSupport: activeTheme.support,
+    available: THEME_NAMES,
+    warnings: cliSettingsResult.warnings,
+  }
+}
+
+function handleConfigTheme() {
+  const requested = args[2] && !args[2].startsWith("-") ? args[2] : undefined
+  const requestedTheme = validateThemeFlag(requested) ?? configThemeArg
+  const requestedAccent = validateAccentFlag(accentArg)
+  if (requestedTheme || requestedAccent) {
+    const patch: Partial<Settings> = {}
+    if (requestedTheme) patch.theme = requestedTheme
+    if (requestedAccent) patch.accent = requestedAccent
+    const { path, settings } = saveGlobalSettings({ env: process.env, home: homedir() }, patch)
+    const effective = loadSettings({ env: process.env, home: homedir(), cwd: process.cwd() }).settings
+    const overriddenByProject = effective.theme !== settings.theme || effective.accent !== settings.accent
+    if (shouldPrintHumanSummary()) {
+      const overrideLine = overriddenByProject
+        ? `\n  ${DIM}Project .secapi/settings.json currently overrides the effective appearance (${effective.theme}${effective.accent ? `, ${effective.accent}` : ""}).${RESET}`
+        : ""
+      writeOutput(`${BOLD}Theme settings saved.${RESET}\n  Theme: ${CYAN}${settings.theme}${RESET}\n  Accent: ${settings.accent ?? `${DIM}(theme default)${RESET}`}\n  ${DIM}Saved to ${path}${RESET}${overrideLine}\n  ${DIM}Restart or run a new command to see it.${RESET}`)
+    } else {
+      print({
+        object: "secapi_cli_theme",
+        updated: true,
+        theme: settings.theme,
+        accent: settings.accent ?? null,
+        effectiveTheme: effective.theme,
+        effectiveAccent: effective.accent ?? null,
+        overriddenByProject,
+        path,
+      })
+    }
+    return
+  }
+  const report = localThemeReport()
+  if (shouldPrintHumanSummary()) {
+    writeOutput(
+      [
+        `${BOLD}Appearance${RESET}`,
+        `  Active theme:  ${CYAN}${report.theme}${RESET}`,
+        `  Accent:        ${report.accent ?? `${DIM}(theme default)${RESET}`}`,
+        `  Color support: ${report.colorSupport}`,
+        `  Available:     ${report.available.join(", ")}`,
+        `${DIM}Persist with 'secapi config theme <name>' or 'secapi config theme --theme <name>'. Global '--theme' before other commands is session-only.${RESET}`,
+      ].join("\n"),
+    )
+  } else {
+    print(report)
+  }
 }
 
 function nearestCommandSuggestions(label: string) {
@@ -2499,10 +2899,195 @@ function maybePrintCommandHelp(group: string, command: string) {
   throw new Error(unknownCommandError())
 }
 
+// Live `<command> --watch` dashboard (TTY only). Re-spawns the command (minus
+// the watch control flags) on an interval inside an Ink full-screen view.
+async function launchWatch(commandKey: string) {
+  const { start } = await import("./tui/watch-view.tsx")
+  // Accept both `--interval 30` and `--interval=30`; resolveIntervalMs falls
+  // back to the domain default for undefined/non-finite values.
+  let intervalSeconds: number | undefined
+  const filtered: string[] = []
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i]
+    if (a === "--watch" || a === "--once") continue
+    if (a === "--interval") {
+      const value = args[i + 1]
+      if (value !== undefined && !value.startsWith("--")) intervalSeconds = Number(value)
+      i += 1 // skip its value too
+      continue
+    }
+    if (a.startsWith("--interval=")) {
+      intervalSeconds = Number(a.slice("--interval=".length))
+      continue
+    }
+    if (a.startsWith("--watch=") || a.startsWith("--once=")) continue
+    filtered.push(a)
+  }
+  await start({
+    command: filtered,
+    intervalMs: resolveIntervalMs(commandKey, intervalSeconds),
+    selfExec: process.execPath,
+    selfEntry: process.argv[1] ?? "",
+    title: `secapi ${commandKey}`,
+    forwardedArgs: buildForwardedGlobalArgs(),
+  })
+}
+
+function buildForwardedGlobalArgs(): string[] {
+  const forwardedArgs: string[] = []
+  if (profileArg) forwardedArgs.push("--profile", profileArg)
+  if (baseUrlArg) forwardedArgs.push("--base-url", resolveBaseUrl())
+  if (themeArg) forwardedArgs.push("--theme", themeArg)
+  if (accentArg) forwardedArgs.push("--accent", accentArg)
+  return forwardedArgs
+}
+
+async function launchInteractive() {
+  const [{ start }, { buildPaletteEntries }] = await Promise.all([
+    import("./tui/app.tsx"),
+    import("./tui/palette.ts"),
+  ])
+  await start({
+    version: cliVersion(),
+    commandCount: commandRegistry.all().length,
+    selfExec: process.execPath,
+    selfEntry: process.argv[1] ?? "",
+    paletteEntries: buildPaletteEntries(commandRegistry),
+    sessionId: createSessionId(),
+    forwardedArgs: buildForwardedGlobalArgs(),
+  })
+}
+
+// `secapi login` — verify a key works and record WHICH env var holds it (never
+// the key itself), so a profile can read it later. Resolves its own base URL +
+// key so it doesn't require a pre-existing profile.
+async function runLogin() {
+  const stdin = hasFlag(STDIN_FLAG_NAME)
+  const wantPrint = hasFlag("--print") || hasFlag("--dry-run")
+  const selectedProfile = activeProfileName()
+  const targetProfileName = selectedProfile?.value?.trim() || undefined
+  const profileName = targetProfileName ? safeProfileName(targetProfileName, selectedProfile?.source ?? "profile name") : undefined
+  const targetProfile = profileName ? existingProfile(profileName) : undefined
+  baseUrl = resolveBaseUrl({ profile: targetProfile ?? null })
+  const apiKeyEnvSource = stdin ? undefined : (envCredentialWithSource(...API_KEY_ENV_NAMES) ?? envNameValue(targetProfile?.apiKeyEnv))?.source
+  const plan = buildLoginPlan({
+    profileName,
+    apiKeyEnvSource,
+    stdin,
+    baseUrl,
+    defaultBaseUrl: "https://api.secapi.ai",
+  })
+
+  if (wantPrint) {
+    print({
+      object: "secapi_cli_login",
+      dryRun: true,
+      profile: plan.profile,
+      apiKeyEnv: plan.apiKeyEnv,
+      baseUrl: plan.baseUrl ?? null,
+      willWrite: profileConfigPath(),
+    })
+    return
+  }
+
+  const apiKey = stdin ? await readCredentialFromStdin(STDIN_FLAG_NAME) : envCredential(...API_KEY_ENV_NAMES) ?? envNameValue(targetProfile?.apiKeyEnv)?.value
+  if (!apiKey) throw new Error(NO_KEY_MESSAGE)
+
+  const principal = await defaultClient({ apiKey }).me()
+  const configPath = writeProfileEntry(plan.profile, { apiKeyEnv: plan.apiKeyEnv, baseUrl: plan.baseUrl ?? null })
+  const who = nestedRecord(asRecord(principal), "principal")
+  print({
+    object: "secapi_cli_login",
+    verified: true,
+    profile: plan.profile,
+    apiKeyEnv: plan.apiKeyEnv,
+    configPath,
+    principal: {
+      authMode: fieldString(who, "authMode"),
+      orgId: fieldString(who, "orgId"),
+      plan: fieldString(who, "publicPlanKey"),
+      billingState: fieldString(who, "billingState"),
+    },
+    next:
+      stdin && plan.apiKeyEnv === "SECAPI_API_KEY"
+        ? "Add the key to your shell so it persists: export SECAPI_API_KEY=<your key>"
+        : `Profile '${plan.profile}' reads your key from $${plan.apiKeyEnv}.`,
+  })
+}
+
+// `secapi schedule` — natural-language scheduled commands (Grok /schedule). The
+// CLI persists schedules; `schedule run-due --execute` is meant to be invoked by
+// the OS scheduler (cron/launchd). Local-only except run-due --execute.
+function runSchedule(sub: string) {
+  const home = homedir()
+  if (sub === "add") {
+    const when = getStringFlag("--when")
+    const run = getStringFlag("--run")
+    if (!when || !run) throw new Error('Usage: secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL"')
+    const spec = parseSchedule(when)
+    if (!spec) throw new Error(`Could not understand schedule "${when}". Try "every weekday 7am", "daily 9:30am", "every monday 8am", "hourly", or "every 15 minutes".`)
+    const task: ScheduledTask = {
+      id: `sch_${Date.now().toString(36)}`,
+      command: run,
+      spec,
+      description: describeSpec(spec),
+      createdAt: new Date().toISOString(),
+    }
+    const tasks = loadSchedules(process.env, home)
+    tasks.push(task)
+    const path = saveSchedules(process.env, home, tasks)
+    print({ object: "secapi_cli_schedule", added: task.id, command: task.command, schedule: task.description, path })
+    return
+  }
+  if (sub === "list") {
+    print({ object: "secapi_cli_schedules", tasks: loadSchedules(process.env, home) })
+    return
+  }
+  if (sub === "remove") {
+    const id = args[2]
+    if (!id) throw new Error("Usage: secapi schedule remove <id>")
+    const tasks = loadSchedules(process.env, home)
+    const next = tasks.filter((t) => t.id !== id)
+    saveSchedules(process.env, home, next)
+    print({ object: "secapi_cli_schedule", removed: id, remaining: next.length })
+    return
+  }
+  if (sub === "run-due") {
+    const now = Date.now()
+    const tasks = loadSchedules(process.env, home)
+    const due = tasks.filter((t) => isDue(t, now))
+    const dueIds = new Set(due.map((t) => t.id))
+    if (dueIds.size > 0) {
+      saveSchedules(process.env, home, tasks.map((task) => (dueIds.has(task.id) ? { ...task, lastRunMs: now } : task)))
+    }
+    print({
+      object: "secapi_cli_schedule_due",
+      now: new Date(now).toISOString(),
+      due: due.map((t) => ({ id: t.id, command: t.command, schedule: t.description })),
+      note: due.length === 0 ? "Nothing due." : "Run each command, or wire `secapi schedule run-due` into cron/launchd.",
+    })
+    return
+  }
+  throw new Error("Usage: secapi schedule <add|list|remove|run-due>")
+}
+
 async function main() {
+  // Capture bare-invocation status from the RAW argv before any global-flag
+  // consumption below, so `secapi --profile foo` (no command) still routes to
+  // help, not the interactive TUI.
+  const launchedWithNoArgs = args.length === 0
   rejectCredentialArgvFlags()
   profileArg = consumeGlobalStringArg("--profile")
   baseUrlArg = consumeGlobalStringArg("--base-url")
+  // Appearance flags were already read at startup to build the theme; consume
+  // them here so they don't leak into command/positional parsing or trip the
+  // unknown-flag check on strict commands.
+  configThemeArg = validateThemeFlag(peekStringFlagAfterCommand(["config", "theme"], "--theme"))
+  themeArg = validateThemeFlag(consumeGlobalStringArg("--theme"))
+  accentArg = validateAccentFlag(consumeGlobalStringArg("--accent"))
+  for (const warning of cliSettingsResult.warnings) {
+    process.stderr.write(`[secapi settings] ${warning}\n`)
+  }
 
   // --version / -v must short-circuit before help fallback so they print the bare
   // version rather than the full command banner.
@@ -2511,15 +3096,56 @@ async function main() {
     return
   }
 
+  // Interactive TUI: a bare `secapi` in a real terminal opens the REPL. Piped,
+  // redirected, CI, dumb-terminal, and every arg'd invocation keep today's exact
+  // behavior, so agents and the test/bench/smoke gates (all non-TTY) are
+  // unaffected. The Ink app is loaded via a dynamic import so one-shot startup
+  // never pays React/Ink's cost.
+  if (
+    shouldLaunchInteractive({
+      noArgs: launchedWithNoArgs,
+      stdoutIsTty: process.stdout.isTTY === true,
+      stdinIsTty: process.stdin.isTTY === true,
+      ci: Boolean(process.env.CI),
+      term: process.env.TERM,
+    })
+  ) {
+    await launchInteractive()
+    return
+  }
+
   const [group = "help", command = ""] = args
+
+  // `secapi chat` / `secapi tui` explicitly launch the interactive REPL.
+  if (group === "chat" || group === "tui") {
+    if (maybePrintCommandHelp(group, command)) return
+    readBooleanFlag("--json")
+    outputPathFlag()
+    resolveBaseUrl()
+    if (
+      shouldLaunchInteractive({
+        noArgs: true,
+        stdoutIsTty: process.stdout.isTTY === true,
+        stdinIsTty: process.stdin.isTTY === true,
+        ci: Boolean(process.env.CI),
+        term: process.env.TERM,
+      })
+    ) {
+      await launchInteractive()
+    } else {
+      throw new Error("Interactive mode requires a terminal. Run `secapi` (no arguments) in an interactive shell.")
+    }
+    return
+  }
   const wantsFullRootHelp = group === "--help-all" || (group === "help" && command === "all")
   const isRootHelp = args.length === 0 || group === "help" || group === "--help" || group === "-h" || wantsFullRootHelp
   if (maybePrintCommandHelp(group, command)) return
   const implementedCommandKey = implementedCommandKeyForArgs(group, command)
   if (implementedCommandKey) rejectUnknownOptionFlags(implementedCommandKey)
+  readBooleanFlag("--json")
   outputPathFlag()
   const wantsDryRun = hasFlag("--dry-run")
-  if (wantsDryRun && implementedCommandKey && !supportsMutationDryRun(implementedCommandKey) && implementedCommandKey !== "init" && implementedCommandKey !== "mcp install" && implementedCommandKey !== "agents setup") {
+  if (wantsDryRun && implementedCommandKey && !supportsMutationDryRun(implementedCommandKey) && implementedCommandKey !== "init" && implementedCommandKey !== "mcp install" && implementedCommandKey !== "agents setup" && implementedCommandKey !== "login") {
     throw new Error(`--dry-run is not supported for secapi ${implementedCommandKey}\nRun 'secapi ${implementedCommandKey} --help' for supported options.`)
   }
 
@@ -2538,6 +3164,37 @@ async function main() {
     return
   }
 
+  if (group === "config" && command === "theme") {
+    handleConfigTheme()
+    return
+  }
+
+  if (group === "login") {
+    await runLogin()
+    return
+  }
+
+  if (group === "schedule") {
+    runSchedule(command)
+    return
+  }
+
+  // Live --watch dashboard: only for a watchable command in a real TTY. Piped /
+  // CI / --json / --once fall through to a single one-shot run (pipe-safe).
+  if (hasFlag("--watch") && implementedCommandKey && isWatchable(implementedCommandKey)) {
+    const decision = decideWatch({
+      watchFlag: true,
+      onceFlag: hasFlag("--once"),
+      isTty: process.stdout.isTTY === true,
+      jsonFlag: readBooleanFlag("--json"),
+      hasOutputPath: hasRawFlag("--output"),
+    })
+    if (decision.watch) {
+      await launchWatch(implementedCommandKey)
+      return
+    }
+  }
+
   if (!isRootHelp) baseUrl = resolveBaseUrl()
   if (group === "config" && command === "show") {
     print(localConfigReport())
@@ -2553,7 +3210,7 @@ async function main() {
       ? {}
       : await resolveCredentials()
   const apiClient = defaultClient(credentials)
-  const anonymousClient = new SecApiClient({ baseUrl, fetch: captureFetch(), headers: cliHeaders() })
+  const anonymousClient = new SecApiClient({ baseUrl, fetch: captureFetch() })
 
   if (group === "health") {
     print(await apiClient.health())
@@ -3013,7 +3670,7 @@ async function main() {
   }
 
   if (group === "filings" && command === "latest") {
-    print(await apiClient.latestFiling({
+    renderer.resource("filing", await apiClient.latestFiling({
       ticker: getFlag("--ticker"),
       cik: getFlag("--cik"),
       form: getFlag("--form") ?? "10-K",
@@ -3489,6 +4146,7 @@ async function main() {
   if (group === "macro" && command === "high-signal-pack") {
     print(await apiClient.macroHighSignalPack({
       country: getFlag("--country"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3497,6 +4155,7 @@ async function main() {
     print(await apiClient.macroRegimes({
       country: getFlag("--country"),
       lookback: getFlag("--lookback"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3508,6 +4167,7 @@ async function main() {
       country: getFlag("--country") ?? "US",
       indicator_key: indicatorKey,
       limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3516,7 +4176,10 @@ async function main() {
     print(await apiClient.macroReleases({
       country: getFlag("--country"),
       indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
+      status: getEnumFlag("--status", ["released", "scheduled"], "macro release status"),
+      days: getNumberFlag("--days"),
       limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3524,7 +4187,10 @@ async function main() {
   if (group === "macro" && command === "calendar") {
     print(await apiClient.macroCalendar({
       country: getFlag("--country"),
+      indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
       days: getNumberFlag("--days"),
+      limit: getNumberFlag("--limit"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3534,6 +4200,7 @@ async function main() {
       country: getFlag("--country"),
       indicator_key: getFlag("--indicator") ?? getFlag("--indicator-key"),
       horizons: getNumberFlag("--horizons"),
+      ...macroResponseParams(),
     }))
     return
   }
@@ -3601,7 +4268,7 @@ async function main() {
       points: getNumberFlag("--points") ?? getNumberFlag("--point-limit") ?? getNumberFlag("--pointLimit") ?? getNumberFlag("--point_limit"),
     }
     if (getFlag("--format") === "csv") printRaw(await apiClient.factorSparklinesCsv(params))
-    else print(await apiClient.factorSparklines(params))
+    else renderer.resource("factors", await apiClient.factorSparklines(params))
     return
   }
 
@@ -4099,7 +4766,7 @@ async function main() {
     const clients: Record<string, { kind: "command" } | FileSpec> = {
       "claude-code": { kind: "command" },
       "claude-desktop": { kind: "file", urlKey: "url", httpType: true, keyValue: literalKey, committable: false, path: claudeDesktopPath },
-      cursor: { kind: "file", urlKey: "url", httpType: false, keyValue: "${env:SECAPI_API_KEY}", committable: true, path: () => join(process.cwd(), ".cursor", "mcp.json") },
+      cursor: { kind: "file", urlKey: "url", httpType: false, keyValue: "${SECAPI_API_KEY}", committable: true, path: () => join(process.cwd(), ".cursor", "mcp.json") },
       windsurf: { kind: "file", urlKey: "serverUrl", httpType: false, keyValue: "${env:SECAPI_API_KEY}", committable: false, path: () => join(homedir(), ".codeium", "windsurf", "mcp_config.json") },
       project: { kind: "file", urlKey: "url", httpType: true, keyValue: "${SECAPI_API_KEY}", committable: true, path: () => join(process.cwd(), ".mcp.json") },
     }
@@ -4210,9 +4877,9 @@ async function main() {
     "",
     "Start here:",
     "  secapi doctor                         # diagnose base URL, auth, health, account, and MCP setup",
-    "  secapi support bundle                 # redacted packet for support tickets and agents",
     "  secapi examples                       # starter workflows for humans and agents",
     "  secapi agent-context                  # machine-readable command inventory for agents",
+    "  secapi support bundle                 # redacted setup + doctor bundle for support handoffs",
     "  secapi config show                    # local config/auth-source summary; no API request",
     "  secapi config profiles                # list no-secret profiles; no API request",
     "",
@@ -4267,7 +4934,6 @@ async function main() {
     "  secapi config show",
     "  secapi config profiles",
     "  secapi examples",
-    "  secapi support bundle --request-id req_...",
     "  secapi me",
     "  secapi org show",
     "  secapi billing show",
@@ -4375,10 +5041,10 @@ async function main() {
     "  secapi macro search --q inflation --country US",
     "  secapi macro high-signal-pack --country US",
     "  secapi macro regimes --country US --lookback 18m",
-    "  secapi macro indicators --country US --indicator CPIAUCSL",
-    "  secapi macro releases --country US",
-    "  secapi macro calendar --country US --days 30",
-    "  secapi macro forecasts --country US",
+    "  secapi macro indicators --country US --indicator CPIAUCSL --response-mode compact",
+    "  secapi macro releases --country US --status released",
+    "  secapi macro calendar --country US --days 30 --limit 12 --response-mode compact",
+    "  secapi macro forecasts --country US --response-mode compact",
     "  secapi macro credit-ratings --country US",
     "",
     "  # Factors",
