@@ -100,6 +100,38 @@ export interface RunCommandOptions {
   signal?: AbortSignal
 }
 
+export interface RunShellCommandOptions {
+  spawner?: Spawner
+  baseEnv?: NodeJS.ProcessEnv
+  signal?: AbortSignal
+  /** Injectable for tests; defaults to process.platform. */
+  platform?: NodeJS.Platform
+}
+
+/** Picks the shell + invocation args for `!<command>` on the current platform. */
+export function chooseShell(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): { shell: string; args: (command: string) => string[] } {
+  if (platform === "win32") {
+    const shell = env.ComSpec?.trim() || env.COMSPEC?.trim() || "cmd.exe"
+    return { shell, args: (command) => ["/d", "/s", "/c", command] }
+  }
+  const shell = env.SHELL?.trim() || "/bin/sh"
+  return { shell, args: (command) => ["-c", command] }
+}
+
+/**
+ * `!<command>` bash-escape — runs `command` through the user's own shell
+ * ($SHELL on POSIX, ComSpec/cmd.exe on Windows). This is the same trust
+ * boundary as the user typing the command in their real terminal: no extra
+ * sanitization is applied (it IS shell syntax by definition), but it never
+ * touches SECAPI_* credentials beyond what the ambient environment already has.
+ */
+export async function runShellCommand(command: string, opts: RunShellCommandOptions = {}): Promise<ExecResult> {
+  const spawner = opts.spawner ?? defaultSpawner
+  const env = opts.baseEnv ?? process.env
+  const { shell, args } = chooseShell(env, opts.platform ?? process.platform)
+  return spawner(shell, args(command), env, opts.signal)
+}
+
 export async function runCommand(input: string, opts: RunCommandOptions): Promise<ExecResult> {
   const tokens = tokenizeCommand(input)
   if (tokens.length === 0) return { stdout: "", stderr: "", code: 0 }

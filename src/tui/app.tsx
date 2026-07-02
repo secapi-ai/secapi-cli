@@ -12,18 +12,28 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   createSessionId,
   exportSessionAs,
+  forkTranscript,
   latestSessionId,
   listSessions,
   loadSession,
   normalizeExportFormat,
   redactSessionEntry,
+  rewindEntries,
   saveSession,
   type SessionEntry,
   type SessionTranscript,
 } from "../session/session.ts"
 import { createCostLedger, extractRequestSummary, formatCostFooter, stripRequestSummary } from "../cost/cost.ts"
 import { expandSkill, findSkillShortcut, skillIsMetered, SKILL_SHORTCUTS } from "../skills/catalog.ts"
-import { runCommand, tokenizeCommand, type ExecResult } from "./exec.ts"
+import { buildDdMemo, type SkillStepResult } from "../skills/memo.ts"
+import {
+  expandBangCommand,
+  expandMentionShorthand,
+  isHelpAlias,
+  parseLookupQuery,
+  parsePinContext,
+} from "./affordances.ts"
+import { runCommand, runShellCommand, tokenizeCommand, type ExecResult } from "./exec.ts"
 import { modeIndicator, modeMeta, nextMode, type ModeKey } from "./modes.ts"
 import { filterPalette, type PaletteEntry } from "./palette.ts"
 import { parseSlash, SLASH_COMMANDS } from "./slash.ts"
@@ -53,7 +63,20 @@ export interface StartOptions {
 
 const MUTATING_TERMS = new Set(["checkout", "create", "delete", "install", "init", "post", "put", "setup", "update"])
 
-export function commandPlan(input: string): string {
+/** A real quoteBilling result, pre-fetched by the caller (Plan mode only quotes
+ * commands known to hit a billable meter class — currently `intelligence *`,
+ * the SDK's ai_queries-metered group). */
+export interface PlanBillingQuote {
+  amountCents: number
+  budgetGate?: { code: string; message: string } | null
+}
+
+/** Is this the one command group Plan mode knows how to quote a real cost for? */
+export function isQuotableInPlanMode(tokens: string[]): boolean {
+  return tokens[0] === "intelligence"
+}
+
+export function commandPlan(input: string, quote?: PlanBillingQuote | null): string {
   const tokens = tokenizeCommand(input)
   if (tokens.length === 0) return "Plan: no command entered."
   const machineOutput = tokens.includes("--json") || tokens.some((token) => token.startsWith("--json=")) || tokens.includes("--output") || tokens.some((token) => token.startsWith("--output="))
@@ -64,8 +87,14 @@ export function commandPlan(input: string): string {
     `Execution: ${localOnly ? "local-first" : "API request likely"}`,
     `Output: ${machineOutput ? "machine-readable/file output requested" : "interactive rich output if supported"}`,
     `Risk: ${mutating ? "may create, install, update, or change account state" : "read-only or diagnostic-looking command"}`,
-    "No command was run. Switch to Run mode to execute it.",
   ]
+  if (quote) {
+    lines.push(`Estimated cost: $${(quote.amountCents / 100).toFixed(4)} (ai_queries meter)`)
+    if (quote.budgetGate) lines.push(`Budget: ${quote.budgetGate.message}`)
+  } else if (isQuotableInPlanMode(tokens)) {
+    lines.push("Estimated cost: unavailable (could not reach the billing quote endpoint)")
+  }
+  lines.push("No command was run. Switch to Run mode to execute it.")
   return lines.join("\n")
 }
 
@@ -133,6 +162,7 @@ export function Repl(options: StartOptions) {
   const abortRef = useRef<AbortController | null>(null)
   const ledger = useRef(createCostLedger())
   const [meterText, setMeterText] = useState("")
+  const pinnedNote = useRef<string | null>(null)
 
   const palette = useMemo(
     () => (paletteOpen ? filterPalette(options.paletteEntries, input) : []),
@@ -263,10 +293,62 @@ export function Repl(options: StartOptions) {
           )
           return true
         }
+        case "fork": {
+          const current = transcript()
+          if (current.entries.length === 0) {
+            push("info", "Nothing to fork yet — run a command first.")
+            return true
+          }
+          try {
+            saveCurrentSession()
+          } catch {
+            // Forking should still work if the best-effort source save fails.
+          }
+          const forked = forkTranscript(current)
+          activeSessionId.current = forked.id
+          startedAt.current = forked.startedAt
+          push("info", `Forked into session ${forked.id} (${forked.entries.length} entries carried over). New turns append here, not to the original.`)
+          return true
+        }
+        case "rewind": {
+          const effectiveTurns = Number.isFinite(Number.parseInt(parsed.args[0] ?? "1", 10)) ? Number.parseInt(parsed.args[0] ?? "1", 10) : 1
+          // submit() already pushed THIS "/rewind" line as a prompt entry before
+          // handleSlash ran, so drop that self-entry first — otherwise /rewind
+          // would undo its own invocation instead of the turn before it.
+          const withoutSelf = sessionEntries.current.slice(0, -1)
+          const rewound = rewindEntries(withoutSelf, effectiveTurns)
+          if (rewound.length === withoutSelf.length) {
+            push("info", "Nothing to rewind yet.")
+            return true
+          }
+          replaceSessionEntries(rewound)
+          push("info", `Rewound ${effectiveTurns} turn(s).`)
+          return true
+        }
+        case "share": {
+          try {
+            const current = transcript()
+            if (current.entries.length === 0) {
+              push("info", "No session entries to share.")
+            } else {
+              const path = exportSessionAs(process.env, homedir(), current, "md")
+              push("info", `Saved a shareable, redacted transcript to ${path} (secrets are always redacted before export).`)
+            }
+          } catch (error) {
+            push("error", `Could not save session: ${String(error)}`)
+          }
+          return true
+        }
         case "help":
           push(
             "info",
-            ["Commands: any `secapi` command works here (without the `secapi` prefix).", "Slash commands:", ...SLASH_COMMANDS.map((c) => `  /${c.name} — ${c.summary}`), "Keys: shift+tab cycle mode · ↑/↓ history · ctrl+l clear · ctrl+d exit"].join("\n"),
+            [
+              "Commands: any `secapi` command works here (without the `secapi` prefix).",
+              "Slash commands:",
+              ...SLASH_COMMANDS.map((c) => `  /${c.name} — ${c.summary}`),
+              "Input affordances: `@TICKER` resolve an entity · `!cmd` run a shell command · `#note` pin a scratch note (`#` clears it) · `:prefix` look up factor/form/section keys · `?` alias for /help",
+              "Keys: shift+tab cycle mode · ↑/↓ history · ctrl+l clear · ctrl+d exit",
+            ].join("\n"),
           )
           return true
         case "mode":
@@ -281,7 +363,10 @@ export function Repl(options: StartOptions) {
           )
           return true
         case "status":
-          push("info", `SEC API CLI v${options.version} · ${options.commandCount} commands · mode: ${mode}`)
+          push(
+            "info",
+            `SEC API CLI v${options.version} · ${options.commandCount} commands · mode: ${mode}${pinnedNote.current ? ` · pinned: ${pinnedNote.current}` : ""}`,
+          )
           return true
         case "theme":
           push("info", "Run `config theme` or relaunch with --theme <name> to change the theme.")
@@ -291,6 +376,15 @@ export function Repl(options: StartOptions) {
             "info",
             "To forget credentials, unset the API key env var (e.g. `unset SECAPI_API_KEY`) and `unset SECAPI_PROFILE` in your shell. The CLI never stores the key, so there is nothing to delete.",
           )
+          return true
+        case "model":
+          push("info", "secapi has no selectable LLM model — it calls the SEC API's own endpoints directly. `intelligence.query` and skill shortcuts run server-side; there is no client-side model to switch.")
+          return true
+        case "mcp":
+          push("info", "Run `secapi mcp install` (or `secapi init`) outside the REPL to write an MCP server config for your agent client. Not run automatically here since it writes a file.")
+          return true
+        case "init":
+          push("info", "Run `secapi init` outside the REPL for the one-command MCP install. Not run automatically here since it writes a file — use `secapi init --dry-run` to preview first.")
           return true
         case "skills":
           push(
@@ -315,7 +409,7 @@ export function Repl(options: StartOptions) {
               [
                 `${shortcut.title}${skillIsMetered(shortcut) ? "  💲 includes AI-metered steps" : ""}`,
                 ...steps.map((s, i) => `  ${i + 1}. ${s.label}${s.metered ? " 💲" : ""}\n     ${s.command}`),
-                "Run the steps above, or copy them into a script. (Auto-run is coming.)",
+                `Run the steps above, copy them into a script, or add --run (e.g. /${shortcut.slash}${shortcut.arg !== "none" ? ` ${parsed.args[0] ?? `<${shortcut.arg}>`}` : ""} --run) to execute them and get a cited memo.`,
               ].join("\n"),
             )
             return true
@@ -336,7 +430,98 @@ export function Repl(options: StartOptions) {
       setHistIndex(null)
       push("prompt", `${BRAND_MARK} ${trimmed}`)
       setInput("")
-      let toRun = trimmed
+
+      // ? is a bare alias for /help.
+      if (isHelpAlias(trimmed)) {
+        handleSlash("/help")
+        return
+      }
+
+      // # pins (or, bare, clears) a scratch note — shown in /status, never sent to the API.
+      const pin = parsePinContext(trimmed)
+      if (pin) {
+        if ("clear" in pin) {
+          pinnedNote.current = null
+          push("info", "Cleared pinned note.")
+        } else {
+          pinnedNote.current = pin.note
+          push("info", `Pinned: ${pin.note}`)
+        }
+        return
+      }
+
+      // : looks up known factor/form/section keys — a cheatsheet, not a live call.
+      const lookup = parseLookupQuery(trimmed)
+      if (lookup) {
+        push("info", lookup.length === 0 ? "No matching keys. Try `:` alone for the full cheatsheet." : `Matches: ${lookup.join(", ")}`)
+        return
+      }
+
+      // ! runs a real shell command through the user's own shell (same trust
+      // boundary as typing it in a real terminal).
+      const bang = expandBangCommand(trimmed)
+      if (bang !== null) {
+        setRunning(true)
+        const controller = new AbortController()
+        abortRef.current = controller
+        try {
+          const result = await runShellCommand(bang, { signal: controller.signal })
+          if (shouldTreatAsCancelled(result, controller.signal.aborted)) {
+            push("info", "Command cancelled.")
+            return
+          }
+          if (result.stdout.trim() !== "") push("output", result.stdout.replace(/\n+$/, ""))
+          if (result.stderr.trim() !== "") push(childStderrKind(result), result.stderr.replace(/\n+$/, ""))
+        } finally {
+          abortRef.current = null
+          setRunning(false)
+        }
+        return
+      }
+
+      // /skill <arg> --run auto-executes every step of a skill-shortcut recipe
+      // and stitches the results into one cited Markdown memo — finishing what
+      // the plain (preview-only) /skill <arg> intentionally stops short of.
+      if (trimmed.startsWith("/")) {
+        const parsedForRun = parseSlash(trimmed)
+        const shortcut = parsedForRun ? findSkillShortcut(parsedForRun.name) : undefined
+        if (shortcut && parsedForRun!.args.includes("--run")) {
+          const arg = parsedForRun!.args.find((a) => a !== "--run") ?? ""
+          if (shortcut.arg !== "none" && !arg) {
+            push("info", `Usage: /${shortcut.slash} <${shortcut.arg}> --run`)
+            return
+          }
+          const steps = expandSkill(shortcut, arg)
+          setRunning(true)
+          setSessionCalls((n) => n + steps.length)
+          const results: SkillStepResult[] = []
+          for (const step of steps) {
+            push("info", `◆ running — ${step.label}`)
+            const result = await runCommand(step.command.replace(/^secapi\s+/, ""), {
+              selfExec: options.selfExec,
+              selfEntry: options.selfEntry,
+              forwardedArgs: options.forwardedArgs,
+              // Raw JSON (not rich cards) — the memo embeds each step's output
+              // verbatim in a ```json block, so ANSI-decorated text would be noise.
+              rich: false,
+            })
+            const cost = extractRequestSummary(result.stderr)
+            if (cost) {
+              ledger.current.record(cost)
+              setMeterText(ledger.current.meterText())
+            }
+            const ok = result.code === 0
+            results.push({ label: step.label, command: step.command, metered: step.metered, stdout: result.stdout, stderr: stripRequestSummary(result.stderr), ok })
+            push(ok ? "info" : "error", `◆ ${ok ? "done" : "error"} — ${step.label}`)
+          }
+          setRunning(false)
+          push("output", buildDdMemo(shortcut, arg, results))
+          return
+        }
+      }
+
+      // @TICKER as the whole line is shorthand for entities resolve --ticker TICKER.
+      let toRun = expandMentionShorthand(trimmed) ?? trimmed
       if (trimmed.startsWith("/")) {
         const parsed = parseSlash(trimmed)
         // A few slash commands map to real CLI commands (rich output captured below).
@@ -346,13 +531,90 @@ export function Repl(options: StartOptions) {
           toRun = "agents personas"
         } else if (parsed?.name === "prompts") {
           toRun = ["agents", "prompts", "list", ...parsed.args].join(" ")
+        } else if (parsed?.name === "persona") {
+          if (parsed.args.length === 0) {
+            push("info", "Usage: /persona <slug> — see /personas for the full list.")
+            return
+          }
+          // agents personas only ever prints the full roster; --persona is read
+          // by `agents prompts list`, which filters the prompt library by lens.
+          toRun = `agents prompts list --persona ${parsed.args[0]}`
+        } else if (parsed?.name === "prompt") {
+          if (parsed.args.length === 0) {
+            push("info", "Usage: /prompt <id> — see /prompts for the full list.")
+            return
+          }
+          toRun = ["agents", "prompts", "read", ...parsed.args].join(" ")
+        } else if (parsed?.name === "config") {
+          toRun = "config show"
+        } else if (parsed?.name === "profile") {
+          toRun = "config profiles"
+        } else if (parsed?.name === "whoami") {
+          toRun = "me"
+        } else if (parsed?.name === "budget") {
+          toRun = "billing show"
+        } else if (parsed?.name === "doctor") {
+          toRun = "doctor"
+        } else if (parsed?.name === "trace") {
+          if (parsed.args.length === 0) {
+            push("info", "Usage: /trace <trace-id> — e.g. /trace tr_abc123")
+            return
+          }
+          toRun = `traces get --trace-id ${parsed.args[0]}`
+        } else if (parsed?.name === "reconcile") {
+          if (parsed.args.length === 0) {
+            push("info", "Usage: /reconcile <figure or phrase> — proves it against the source filing")
+            return
+          }
+          // Quote the joined query so it survives re-tokenization as one --q value.
+          const query = parsed.args.join(" ").replace(/"/g, "")
+          toRun = `search semantic --q "${query}"`
+        } else if (parsed?.name === "monitor") {
+          if (parsed.args.length === 0) {
+            toRun = "monitors list"
+          } else {
+            const query = parsed.args.join(" ").replace(/"/g, "")
+            const name = query.length > 60 ? `${query.slice(0, 57)}...` : query
+            toRun = `monitors create --name "${name}" --query "${query}"`
+          }
+        } else if (parsed?.name === "news") {
+          toRun = parsed.args.length === 0 ? "news" : `news --ticker ${parsed.args[0]}`
+        } else if (parsed?.name === "layouts") {
+          // Read-only in the REPL — `layouts run` inherits the terminal for
+          // --watch dashboards, which would fight the already-running Ink app.
+          toRun = "layouts list"
+        } else if (parsed?.name === "remember") {
+          if (parsed.args.length === 0) {
+            push("info", "Usage: /remember <text> — saved across sessions, never sent to the API")
+            return
+          }
+          const text = parsed.args.join(" ").replace(/"/g, "")
+          toRun = `memory add "${text}"`
+        } else if (parsed?.name === "memories") {
+          toRun = "memory list"
         } else {
           handleSlash(trimmed)
           return
         }
       }
       if (mode === "plan") {
-        push("info", commandPlan(toRun))
+        const planTokens = tokenizeCommand(toRun)
+        let quote: PlanBillingQuote | null = null
+        if (isQuotableInPlanMode(planTokens)) {
+          const quoteResult = await runCommand("billing quote --meter-class intelligence_query --units 1", {
+            selfExec: options.selfExec,
+            selfEntry: options.selfEntry,
+            forwardedArgs: options.forwardedArgs,
+            rich: false,
+          })
+          try {
+            const parsed = JSON.parse(quoteResult.stdout) as { amountCents?: number; budgetGate?: { code: string; message: string } | null }
+            if (typeof parsed.amountCents === "number") quote = { amountCents: parsed.amountCents, budgetGate: parsed.budgetGate ?? null }
+          } catch {
+            // Quote unavailable (offline, no auth, etc.) — commandPlan() shows a clear fallback line.
+          }
+        }
+        push("info", commandPlan(toRun, quote))
         return
       }
       if (mode === "ask") {

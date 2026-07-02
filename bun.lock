@@ -5,7 +5,7 @@
     "": {
       "name": "@secapi/cli",
       "devDependencies": {
-        "@secapi/sdk-js": "^1.0.2",
+        "@secapi/sdk-js": "^1.1.0",
         "@types/node": "^24.10.1",
         "@types/react": "^19.1.6",
         "ink": "^6.0.0",
@@ -17,7 +17,7 @@
   "packages": {
     "@alcalzone/ansi-tokenize": ["@alcalzone/ansi-tokenize@0.2.5", "", { "dependencies": { "ansi-styles": "^6.2.1", "is-fullwidth-code-point": "^5.0.0" } }, "sha512-3NX/MpTdroi0aKz134A6RC2Gb2iXVECN4QaAXnvCIxxIm3C3AVB1mkUe8NaaiyvOpDfsrqWhYtj+Q6a62RrTsw=="],
 
-    "@secapi/sdk-js": ["@secapi/sdk-js@1.0.2", "", { "dependencies": { "zod": "^4.4.3" } }, "sha512-HW/nCmcM6wuXzG12Fq13wArZw1mxPHGiGjt+VR9YOVuHblilFe1SGtnTcK0cHt0L8CG02LuAFKH0NsjhRALHwg=="],
+    "@secapi/sdk-js": ["@secapi/sdk-js@1.1.0", "", { "dependencies": { "zod": "^4.4.3" } }, "sha512-4t0s3/VeHHJZbgeGkudjNCa62ItQznwLHLB9EbMCWlmKdfxDjvDrDsRQMML4Bj8uBxhcjik2B6w0zlI+C8bNsg=="],
 
     "@types/node": ["@types/node@24.13.2", "", { "dependencies": { "undici-types": "~7.18.0" } }, "sha512-fRa09kZTgu8o71KFcDjUFuc7F+dEbZYZmkI0mg5YBTRs0yMKjYHsq/c0urDKeDb+D5qVgXOdFcuu+DZPKOITwA=="],
 

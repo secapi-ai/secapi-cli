@@ -1303,6 +1303,134 @@ describe("CLI version and search commands", () => {
     }
   })
 
+  test("schedule run-due --execute actually runs due commands and POSTs a redacted job-complete event (Phase 10.3 notify bridge)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "secapi-schedule-notify-cli-"))
+    try {
+      const schedulePath = path.join(dir, "schedules.json")
+      const notifyUrl = `http://127.0.0.1:${server.port}/notify-hook`
+      writeFileSync(schedulePath, `${JSON.stringify({
+        object: "secapi_cli_schedules",
+        tasks: [
+          {
+            id: "sch_notify",
+            command: "health",
+            spec: { kind: "interval", intervalMinutes: 1 },
+            description: "every 1 min",
+            createdAt: "2026-06-30T00:00:00.000Z",
+            notifyWebhookUrl: notifyUrl,
+          },
+        ],
+      }, null, 2)}\n`)
+
+      const result = await runCli(["schedule", "run-due", "--execute"], {
+        env: { SECAPI_SCHEDULE_FILE: schedulePath, SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH" },
+      })
+      expect(result.status).toBe(0)
+      const payload = JSON.parse(result.stdout)
+      expect(payload.object).toBe("secapi_cli_schedule_executed")
+      expect(payload.executed).toEqual([{ id: "sch_notify", command: "health", ok: true, durationMs: expect.any(Number) }])
+
+      const notifyRequest = requests.find((r) => r.path === "/notify-hook")
+      expect(notifyRequest).toBeDefined()
+      expect(notifyRequest?.method).toBe("POST")
+      const notifyBody = JSON.parse(notifyRequest?.body ?? "{}")
+      expect(notifyBody).toMatchObject({ event: "schedule.completed", taskId: "sch_notify", command: "health", ok: true })
+      assertNoSecretLeak(result.stdout, result.stderr)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("schedule run-due --execute exits non-zero when a due command fails, even though the JSON body reports ok: false (Codex review, PR #1207)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "secapi-schedule-fail-cli-"))
+    try {
+      const schedulePath = path.join(dir, "schedules.json")
+      writeFileSync(schedulePath, `${JSON.stringify({
+        object: "secapi_cli_schedules",
+        tasks: [
+          {
+            id: "sch_fail",
+            command: "me",
+            spec: { kind: "interval", intervalMinutes: 1 },
+            description: "every 1 min",
+            createdAt: "2026-06-30T00:00:00.000Z",
+          },
+        ],
+      }, null, 2)}\n`)
+
+      // Point at an unreachable port (env var, not argv --base-url, so it
+      // propagates to the spawned "me" run) — a deterministic connection
+      // failure independent of the shared mock server's shape.
+      const result = await runCli(["schedule", "run-due", "--execute"], {
+        env: { SECAPI_SCHEDULE_FILE: schedulePath, SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH", SECAPI_BASE_URL: "http://127.0.0.1:1" },
+      })
+      expect(result.status).not.toBe(0)
+      const payload = JSON.parse(result.stdout)
+      expect(payload.executed).toEqual([{ id: "sch_fail", command: "me", ok: false, durationMs: expect.any(Number) }])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("layouts save/list/remove round-trip through SECAPI_LAYOUTS_FILE", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "secapi-layouts-cli-"))
+    try {
+      const layoutsPath = path.join(dir, "layouts.json")
+      const env = { SECAPI_LAYOUTS_FILE: layoutsPath }
+
+      const saved = await runCli(["layouts", "save", "--name", "factors-desk", "--run", "factors dashboard --watch"], { env })
+      expect(saved.status).toBe(0)
+      expect(JSON.parse(saved.stdout)).toMatchObject({ saved: "factors-desk", command: "factors dashboard --watch" })
+
+      const list = await runCli(["layouts", "list"], { env })
+      expect(list.status).toBe(0)
+      expect(JSON.parse(list.stdout).layouts.map((l: { name: string }) => l.name)).toEqual(["factors-desk"])
+
+      const removed = await runCli(["layouts", "remove", "factors-desk"], { env })
+      expect(removed.status).toBe(0)
+      expect(JSON.parse(removed.stdout)).toMatchObject({ removed: "factors-desk", remaining: 0 })
+      expect(requests).toHaveLength(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("layouts save requires --name and --run", async () => {
+    const result = await runCli(["layouts", "save", "--name", "only-name"])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain("Usage: secapi layouts save")
+  })
+
+  test("memory add/list/clear round-trip through SECAPI_MEMORY_FILE, refusing secret-shaped notes", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "secapi-memory-cli-"))
+    try {
+      const memoryPath = path.join(dir, "memory.json")
+      const env = { SECAPI_MEMORY_FILE: memoryPath }
+
+      const added = await runCli(["memory", "add", "AAPL earnings call is next Tuesday"], { env })
+      expect(added.status).toBe(0)
+      expect(JSON.parse(added.stdout)).toMatchObject({ added: "AAPL earnings call is next Tuesday" })
+
+      const list = await runCli(["memory", "list"], { env })
+      expect(list.status).toBe(0)
+      expect(JSON.parse(list.stdout).notes.map((n: { text: string }) => n.text)).toEqual(["AAPL earnings call is next Tuesday"])
+
+      const secretNote = await runCli(["memory", "add", "secapi_live_SHOULD_NOT_BE_SAVED"], { env })
+      expect(secretNote.status).not.toBe(0)
+      expect(secretNote.stderr).toContain("looks like it contains a secret")
+      expect(secretNote.stdout).not.toContain("secapi_live_SHOULD_NOT_BE_SAVED")
+      expect(secretNote.stderr).not.toContain("secapi_live_SHOULD_NOT_BE_SAVED")
+      expect(JSON.parse(readFileSync(memoryPath, "utf8")).notes).toHaveLength(1)
+
+      const cleared = await runCli(["memory", "clear"], { env })
+      expect(cleared.status).toBe(0)
+      expect(JSON.parse(readFileSync(memoryPath, "utf8")).notes).toEqual([])
+      expect(requests).toHaveLength(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("--base-url rejects echoed URL secrets before doctor or agent-context output", async () => {
     const doctor = await runCli(["doctor", "--base-url", "http://127.0.0.1:1/?token=secapi_live_ARGV_SHOULD_NOT_LEAK"], {
       env: { SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH" },
@@ -1975,7 +2103,7 @@ describe("CLI version and search commands", () => {
       {
         args: ["billing", "show", "--json=false"],
         title: "SEC API billing",
-        snippets: ["Plan: personal", "Free grant: 60 / 100 remaining", "Budget: $25.00 / $100.00 accrued"],
+        snippets: ["Plan: personal", "Free grant", "40 / 100", "Budget ($)", "25 / 100"],
       },
       {
         args: ["usage", "show", "--json=false"],
@@ -2490,6 +2618,197 @@ describe("CLI version and search commands", () => {
     expect(invalid.stderr).toContain("--transport must be one of: poll, webhook_mirror, websocket")
     expect(requests).toHaveLength(0)
     assertNoSecretLeak(created.stdout + invalid.stdout, created.stderr + invalid.stderr)
+  })
+})
+
+describe("CLI skills list/run (Phase 5.6 NDJSON event stream)", () => {
+  test("skills list prints the catalog as JSON, no API calls", async () => {
+    const result = await runCli(["skills", "list"])
+    expect(result.status).toBe(0)
+    expect(requests).toHaveLength(0)
+    const payload = JSON.parse(result.stdout)
+    expect(payload.object).toBe("list")
+    const slugs = payload.data.map((s: { slash: string }) => s.slash)
+    expect(slugs).toContain("due-diligence")
+    expect(slugs).toContain("track-insiders")
+  })
+
+  test("skills run requires a known slug and its arg", async () => {
+    const missingSlug = await runCli(["skills", "run"])
+    expect(missingSlug.status).not.toBe(0)
+    expect(missingSlug.stderr).toContain("Usage: secapi skills run")
+
+    const unknownSlug = await runCli(["skills", "run", "not-a-real-skill"])
+    expect(unknownSlug.status).not.toBe(0)
+    expect(unknownSlug.stderr).toContain('Unknown skill shortcut "not-a-real-skill"')
+
+    const missingArg = await runCli(["skills", "run", "due-diligence"])
+    expect(missingArg.status).not.toBe(0)
+    expect(missingArg.stderr).toContain("Usage: secapi skills run due-diligence <ticker>")
+  })
+
+  test("skills run emits one NDJSON line per step_start/tool_use/text/step_finish event", async () => {
+    const result = await runCli(["skills", "run", "track-insiders", "AAPL"], {
+      env: { SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH" },
+    })
+    expect(result.status).toBe(0)
+    const lines = result.stdout.trim().split("\n").map((line) => JSON.parse(line))
+    const eventTypes = lines.map((line) => line.event)
+    // 3 steps × 4 events each = 12 lines, in order.
+    expect(eventTypes).toEqual([
+      "step_start", "tool_use", "text", "step_finish",
+      "step_start", "tool_use", "text", "step_finish",
+      "step_start", "tool_use", "text", "step_finish",
+    ])
+    expect(lines[0]).toMatchObject({ index: 0, total: 3, label: "Insider transactions" })
+    expect(lines[1]).toMatchObject({ index: 0, command: "secapi insiders list --ticker AAPL" })
+    expect(typeof lines[3].durationMs).toBe("number")
+    assertNoSecretLeak(result.stdout, result.stderr)
+  })
+
+  test("skills run exits non-zero when a step fails, even though the run completes (Codex review, PR #1207)", async () => {
+    // Point at an unreachable port (env var, not argv --base-url, so it
+    // propagates to every spawned step) — a deterministic connection
+    // failure independent of the shared mock server's shape.
+    const result = await runCli(["skills", "run", "track-insiders", "AAPL"], {
+      env: { SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH", SECAPI_BASE_URL: "http://127.0.0.1:1" },
+    })
+    expect(result.status).not.toBe(0)
+    const lines = result.stdout.trim().split("\n").map((line) => JSON.parse(line))
+    const finishes = lines.filter((line) => line.event === "step_finish")
+    expect(finishes).toHaveLength(3)
+    expect(finishes.every((f) => f.ok === false)).toBe(true)
+  })
+})
+
+describe("CLI bridge telegram validation (Phase 12)", () => {
+  test("requires both --bot-token-env and --allowed-chat-id", async () => {
+    const result = await runCli(["bridge", "telegram"])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain("Usage: secapi bridge telegram")
+    expect(requests).toHaveLength(0)
+  })
+
+  test("refuses a --bot-token-env value that looks like a literal token, not an env var name", async () => {
+    const result = await runCli(["bridge", "telegram", "--bot-token-env", "123456:ABC-DEF", "--allowed-chat-id", "1"])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain("must be the NAME of an environment variable")
+    expect(result.stderr).not.toContain("123456:ABC-DEF")
+    expect(requests).toHaveLength(0)
+  })
+
+  test("fails clearly when the named env var is unset", async () => {
+    const result = await runCli(["bridge", "telegram", "--bot-token-env", "SECAPI_BRIDGE_TEST_TOKEN_NOT_SET", "--allowed-chat-id", "1"])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain("SECAPI_BRIDGE_TEST_TOKEN_NOT_SET is not set")
+    expect(requests).toHaveLength(0)
+  })
+
+  test("requires --allowed-chat-id to be numeric", async () => {
+    const result = await runCli(["bridge", "telegram", "--bot-token-env", "SECAPI_BRIDGE_TEST_TOKEN", "--allowed-chat-id", "not-a-number"], {
+      env: { SECAPI_BRIDGE_TEST_TOKEN: "fake-token-for-test" },
+    })
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain("--allowed-chat-id must be a number")
+    assertNoSecretLeak(result.stdout, result.stderr)
+    expect(requests).toHaveLength(0)
+  })
+})
+
+describe("CLI monitors and news (Phase 10)", () => {
+  const auth = { SECAPI_API_KEY: "secapi_live_ENV_BACKED_AUTH" }
+
+  test("monitors create forwards name/query/searchMode/delivery and supports --dry-run", async () => {
+    const dryRun = await runCli([
+      "monitors", "create", "--name", "8-K risk mentions", "--query", "material weakness", "--email", "you@example.com", "--dry-run",
+    ], { env: auth })
+    expect(dryRun.status).toBe(0)
+    expect(requests).toHaveLength(0)
+    const preview = JSON.parse(dryRun.stdout)
+    expect(preview.request.method).toBe("POST")
+    expect(preview.request.path).toBe("/v1/monitors")
+    expect(preview.request.body).toEqual({
+      name: "8-K risk mentions",
+      query: "material weakness",
+      searchMode: "keyword",
+      delivery: { type: "email", config: { to: "you@example.com" } },
+    })
+
+    const created = await runCli([
+      "monitors", "create", "--name", "8-K risk mentions", "--query", "material weakness", "--webhook-url", "https://example.com/hook",
+    ], { env: auth })
+    expect(created.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/monitors")
+    expect(requests[0]?.method).toBe("POST")
+    expect(JSON.parse(requests[0]?.body ?? "{}")).toEqual({
+      name: "8-K risk mentions",
+      query: "material weakness",
+      searchMode: "keyword",
+      webhookUrl: "https://example.com/hook",
+    })
+    assertNoSecretLeak(dryRun.stdout + created.stdout, dryRun.stderr + created.stderr)
+  })
+
+  test("monitors create requires --name and --query", async () => {
+    const result = await runCli(["monitors", "create", "--name", "only-name"], { env: auth })
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain("Usage: secapi monitors create")
+    expect(requests).toHaveLength(0)
+  })
+
+  test("monitors list forwards to GET /v1/monitors, including --limit", async () => {
+    const result = await runCli(["monitors", "list", "--limit", "50"], { env: auth })
+    expect(result.status).toBe(0)
+    expect(requests[0]?.method).toBe("GET")
+    expect(requests[0]?.path).toBe("/v1/monitors")
+    expect(requests[0]?.searchParams.limit).toBe("50")
+  })
+
+  test("monitors get requires --monitor-id and forwards it in the path", async () => {
+    const missing = await runCli(["monitors", "get"], { env: auth })
+    expect(missing.status).not.toBe(0)
+    expect(missing.stderr).toContain("--monitor-id is required")
+    expect(requests).toHaveLength(0)
+
+    const result = await runCli(["monitors", "get", "--monitor-id", "mon_1"], { env: auth })
+    expect(result.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/monitors/mon_1")
+  })
+
+  test("monitors delete requires --monitor-id and supports --dry-run", async () => {
+    const dryRun = await runCli(["monitors", "delete", "--monitor-id", "mon_1", "--dry-run"], { env: auth })
+    expect(dryRun.status).toBe(0)
+    expect(requests).toHaveLength(0)
+    const preview = JSON.parse(dryRun.stdout)
+    expect(preview.request).toMatchObject({ method: "DELETE", path: "/v1/monitors/mon_1" })
+
+    const result = await runCli(["monitors", "delete", "--monitor-id", "mon_1"], { env: auth })
+    expect(result.status).toBe(0)
+    expect(requests[0]?.method).toBe("DELETE")
+    expect(requests[0]?.path).toBe("/v1/monitors/mon_1")
+  })
+
+  test("monitors matches forwards --monitor-id, --cursor, --limit", async () => {
+    const result = await runCli(["monitors", "matches", "--monitor-id", "mon_1", "--cursor", "c1", "--limit", "5"], { env: auth })
+    expect(result.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/monitors/mon_1/matches")
+    expect(requests[0]?.searchParams.cursor).toBe("c1")
+    expect(requests[0]?.searchParams.limit).toBe("5")
+  })
+
+  test("news forwards ticker/cik/q/limit to GET /v1/news/stories", async () => {
+    const result = await runCli(["news", "--ticker", "AAPL", "--q", "buyback", "--limit", "5"], { env: auth })
+    expect(result.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/news/stories")
+    expect(requests[0]?.searchParams.ticker).toBe("AAPL")
+    expect(requests[0]?.searchParams.q).toBe("buyback")
+    expect(requests[0]?.searchParams.limit).toBe("5")
+  })
+
+  test("news runs with no flags at all", async () => {
+    const result = await runCli(["news"], { env: auth })
+    expect(result.status).toBe(0)
+    expect(requests[0]?.path).toBe("/v1/news/stories")
   })
 })
 
@@ -3780,6 +4099,21 @@ describe("CLI agent setup (init + agent-context)", () => {
       mutates: false,
       requiredFlags: ["--holdings-json|--holdings-file"],
     })
+    // Regression (Codex review, PR #1204): the Telegram bridge's ONLY safety
+    // gate is `mutates` from this exact detail map — every command that
+    // changes local state (including `layouts run`, which can re-execute an
+    // arbitrarily mutating stored command) must report mutates: true, or the
+    // bridge would let an allow-listed chat run it despite promising not to.
+    expect(detailByCommand.get("secapi layouts save")).toMatchObject({ mutates: true })
+    expect(detailByCommand.get("secapi layouts remove")).toMatchObject({ mutates: true })
+    expect(detailByCommand.get("secapi layouts run")).toMatchObject({ mutates: true })
+    expect(detailByCommand.get("secapi layouts list")).toMatchObject({ mutates: false })
+    expect(detailByCommand.get("secapi memory add")).toMatchObject({ mutates: true })
+    expect(detailByCommand.get("secapi memory clear")).toMatchObject({ mutates: true })
+    expect(detailByCommand.get("secapi memory list")).toMatchObject({ mutates: false })
+    // schedule run-due --execute re-spawns whatever command was scheduled —
+    // the same bridge-bypass risk class as layouts run.
+    expect(detailByCommand.get("secapi schedule run-due")).toMatchObject({ mutates: true })
   })
 
   test("init --client claude-code prints the command with a shell env reference, not a literal key", async () => {

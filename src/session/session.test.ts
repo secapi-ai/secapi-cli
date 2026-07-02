@@ -5,6 +5,7 @@ import { join } from "node:path"
 import {
   exportSessionAs,
   createSessionId,
+  forkTranscript,
   isSafeSessionId,
   latestSessionId,
   listSessions,
@@ -12,10 +13,12 @@ import {
   normalizeExportFormat,
   parseSession,
   redactSessionText,
+  rewindEntries,
   saveSession,
   serializeSession,
   serializeSessionMarkdown,
   serializeSessionNdjson,
+  type SessionEntry,
   type SessionTranscript,
 } from "./session.ts"
 
@@ -210,5 +213,56 @@ describe("persistence", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe("forkTranscript", () => {
+  test("copies entries into a brand-new id, never mutating the source", () => {
+    const source = transcript("sess_original")
+    const fork = forkTranscript(source, "2026-06-30T01:00:00.000Z")
+    expect(fork.id).not.toBe(source.id)
+    expect(isSafeSessionId(fork.id)).toBe(true)
+    expect(fork.startedAt).toBe("2026-06-30T01:00:00.000Z")
+    expect(fork.entries).toEqual(source.entries)
+    expect(fork.entries).not.toBe(source.entries) // copied, not aliased
+  })
+})
+
+describe("rewindEntries", () => {
+  const entries: SessionEntry[] = [
+    { ts: "t1", kind: "prompt", text: "turn 1 prompt" },
+    { ts: "t2", kind: "output", text: "turn 1 output" },
+    { ts: "t3", kind: "prompt", text: "turn 2 prompt" },
+    { ts: "t4", kind: "output", text: "turn 2 output" },
+    { ts: "t5", kind: "error", text: "turn 2 error" },
+    { ts: "t6", kind: "prompt", text: "turn 3 prompt" },
+    { ts: "t7", kind: "output", text: "turn 3 output" },
+  ]
+
+  test("drops the last turn by default (n=1)", () => {
+    const out = rewindEntries(entries, 1)
+    expect(out).toHaveLength(5)
+    expect(out.at(-1)?.text).toBe("turn 2 error")
+  })
+
+  test("drops multiple turns", () => {
+    const out = rewindEntries(entries, 2)
+    expect(out).toHaveLength(2)
+    expect(out.at(-1)?.text).toBe("turn 1 output")
+  })
+
+  test("rewinding past the first turn returns an empty transcript, never throws", () => {
+    expect(rewindEntries(entries, 10)).toEqual([])
+  })
+
+  test("n<=0 or non-finite is a no-op", () => {
+    expect(rewindEntries(entries, 0)).toBe(entries)
+    expect(rewindEntries(entries, -1)).toBe(entries)
+    expect(rewindEntries(entries, Number.NaN)).toBe(entries)
+  })
+
+  test("no prompts in the transcript is a no-op", () => {
+    const noPrompts: SessionEntry[] = [{ ts: "t1", kind: "output", text: "x" }]
+    expect(rewindEntries(noPrompts, 1)).toBe(noPrompts)
   })
 })

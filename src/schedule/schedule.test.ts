@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
+  buildScheduleNotifyPayload,
   describeSpec,
   isDue,
   loadSchedules,
@@ -101,5 +102,44 @@ describe("persistence", () => {
     expect(parseSchedules(null)).toEqual([])
     expect(parseSchedules("not json")).toEqual([])
     expect(parseSchedules(JSON.stringify({ tasks: [{}, { id: "ok", command: "c" }] })).length).toBe(1)
+  })
+})
+
+describe("buildScheduleNotifyPayload", () => {
+  const task: ScheduledTask = {
+    id: "sch_1",
+    command: "filings latest --ticker AAPL",
+    spec: { kind: "daily", hour: 7, minute: 0 },
+    description: "daily at 07:00",
+    createdAt: "2026-06-30T00:00:00.000Z",
+    notifyWebhookUrl: "https://example.com/hook",
+  }
+
+  test("builds a schedule.completed event with the task id, command, and result", () => {
+    const payload = buildScheduleNotifyPayload(task, { ok: true, durationMs: 412, output: '{"ticker":"AAPL"}' })
+    expect(payload).toEqual({
+      event: "schedule.completed",
+      taskId: "sch_1",
+      command: "filings latest --ticker AAPL",
+      ok: true,
+      durationMs: 412,
+      output: '{"ticker":"AAPL"}',
+    })
+  })
+
+  test("redacts secret-shaped output the same way session transcripts are redacted", () => {
+    const payload = buildScheduleNotifyPayload(task, { ok: false, durationMs: 10, output: "auth failed for secapi_live_SHOULD_NOT_LEAK" })
+    expect(payload.output).not.toContain("secapi_live_SHOULD_NOT_LEAK")
+    expect(payload.output).toContain("[redacted]")
+  })
+
+  test("also redacts a secret-shaped stored command, not just output (Codex review, PR #1207)", () => {
+    const taskWithSecretInCommand: ScheduledTask = {
+      ...task,
+      command: "filings latest --api-key secapi_live_SHOULD_NOT_LEAK --ticker AAPL",
+    }
+    const payload = buildScheduleNotifyPayload(taskWithSecretInCommand, { ok: true, durationMs: 10, output: "" })
+    expect(payload.command).not.toContain("secapi_live_SHOULD_NOT_LEAK")
+    expect(payload.command).toContain("[redacted]")
   })
 })

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process"
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
@@ -14,7 +15,9 @@ import {
 import { SecApiClient, type FactorApiResponseMode, type ResponseView } from "@secapi/sdk-js"
 import { buildCards } from "./render/cards.ts"
 import { buildLoginPlan, NO_KEY_MESSAGE } from "./auth/login.ts"
+import { maskedPrompt } from "./auth/prompt.ts"
 import {
+  buildScheduleNotifyPayload,
   describeSpec,
   isDue,
   loadSchedules,
@@ -22,13 +25,29 @@ import {
   saveSchedules,
   type ScheduledTask,
 } from "./schedule/schedule.ts"
+import { findLayout, loadLayouts, saveLayouts } from "./layouts/layouts.ts"
+import { loadMemory, saveMemory } from "./memory/memory.ts"
 import { createRenderer, shouldRenderRich } from "./render/renderer.ts"
+import { gauge } from "./render/primitives.ts"
+import {
+  apiKeyShape,
+  blockLiveModeInCi,
+  headersToRecord,
+  runPostRequestHooks,
+  runPreRequestHooks,
+  warnOnExpensiveRequest,
+  type PostRequestHook,
+} from "./runtime/hooks.ts"
 import { buildRegistry, type CommandSpec } from "./registry/registry.ts"
+import { runStreamWatch } from "./runtime/stream-watch.ts"
 import { createSessionId } from "./session/session.ts"
 import { loadSettings, saveGlobalSettings, type Settings } from "./settings/settings.ts"
 import { createTheme, detectColorSupport, parseHexColor } from "./theme/theme.ts"
 import { THEME_NAMES, type ThemeName } from "./theme/themes.ts"
 import { shouldLaunchInteractive } from "./tui/launch.ts"
+import { runCommand, tokenizeCommand } from "./tui/exec.ts"
+import { pollOnce, telegramApiUrl, type BridgeDeps, type TelegramUpdate } from "./bridge/telegram.ts"
+import { expandSkill, findSkillShortcut, SKILL_SHORTCUTS, skillIsMetered, type SkillShortcut } from "./skills/catalog.ts"
 import { decideWatch, isWatchable, resolveIntervalMs } from "./tui/watch.ts"
 
 let args = process.argv.slice(2)
@@ -616,14 +635,29 @@ function formatAccountHuman(commandKey: "me" | "billing show" | "usage show" | "
     const budgetCap = fieldNumber(budget, "spendCapCents")
     const quotaRemaining = fieldNumber(aiQuota, "remaining")
     const quotaLimit = fieldNumber(aiQuota, "limit")
+    const freeGrantLine = freeGrantRemaining === null && freeGrantTotal === null
+      ? "Free grant: not reported"
+      : freeGrantTotal !== null
+        ? gauge(activeTheme, "Free grant", Math.max(0, freeGrantTotal - (freeGrantRemaining ?? freeGrantTotal)), freeGrantTotal)
+        : `Free grant: ${formatInteger(freeGrantRemaining)} remaining`
+    const budgetLine = budgetUsed === null && budgetCap === null
+      ? "Budget: not reported"
+      : budgetCap !== null
+        ? gauge(activeTheme, "Budget ($)", Math.round((budgetUsed ?? 0) / 100), Math.round(budgetCap / 100))
+        : `Budget: ${formatUsdCents(budgetUsed)} accrued`
+    const quotaLine = quotaRemaining === null && quotaLimit === null
+      ? "AI monthly quota: not reported"
+      : quotaLimit !== null
+        ? gauge(activeTheme, "AI monthly quota", Math.max(0, quotaLimit - (quotaRemaining ?? quotaLimit)), quotaLimit)
+        : `AI monthly quota: ${formatInteger(quotaRemaining)} remaining`
     return humanSummaryLines("SEC API billing", [
       `Plan: ${displayValue(fieldString(root, "publicPlanKey"))}`,
       `Billing state: ${displayValue(fieldString(root, "billingState"))}`,
       `Rights: ${displayValue(fieldString(root, "rightsKey"))}`,
       `Card on file: ${displayValue(root.cardOnFile)}`,
-      `Free grant: ${freeGrantRemaining === null && freeGrantTotal === null ? "not reported" : `${formatInteger(freeGrantRemaining)} / ${formatInteger(freeGrantTotal)} remaining`}`,
-      `Budget: ${budgetUsed === null && budgetCap === null ? "not reported" : `${formatUsdCents(budgetUsed)} / ${formatUsdCents(budgetCap)} accrued`}`,
-      `AI monthly quota: ${quotaRemaining === null && quotaLimit === null ? "not reported" : `${formatInteger(quotaRemaining)} / ${formatInteger(quotaLimit)} remaining`}`,
+      freeGrantLine,
+      budgetLine,
+      quotaLine,
       `Request: ${displayValue(fieldString(root, "requestId"))}`,
     ])
   }
@@ -679,6 +713,8 @@ const DRY_RUN_MUTATION_COMMANDS = new Set([
   "billing budget",
   "billing checkout",
   "billing portal",
+  "monitors create",
+  "monitors delete",
   "streams create",
   "webhooks create",
   "webhooks replay-delivery",
@@ -1048,17 +1084,43 @@ function wantsRequestSummary() {
   return hasFlag("--request-summary")
 }
 
-function captureFetch(): typeof fetch {
+// PreRequest/PostRequest lifecycle hooks on the captureFetch seam. PreRequest
+// can block a call before it ever leaves the process (blockLiveModeInCi is
+// always active — a safety default, not opt-in); PostRequest only observes
+// (never blocks — the call already happened) and is opt-in via
+// SECAPI_COST_ALERT_THRESHOLD (a float, in USD).
+const PRE_REQUEST_HOOKS = [blockLiveModeInCi]
+
+function postRequestHooks(): PostRequestHook[] {
+  const threshold = Number(process.env.SECAPI_COST_ALERT_THRESHOLD)
+  if (!Number.isFinite(threshold)) return []
+  return [(context) => warnOnExpensiveRequest(context, threshold)]
+}
+
+function captureFetch(apiKey?: string): typeof fetch {
   return async (input, init) => {
-    const startedAt = Date.now()
-    const response = await fetch(input, init)
     const url = typeof input === "string"
       ? new URL(input)
       : input instanceof URL
         ? input
         : new URL(input.url)
+    const method = (init?.method ?? (typeof input === "object" && "method" in input ? input.method : undefined) ?? "GET").toUpperCase()
+
+    const preResult = runPreRequestHooks(PRE_REQUEST_HOOKS, {
+      url: url.toString(),
+      method,
+      apiKeyShape: apiKeyShape(apiKey),
+      env: process.env,
+    })
+    if (preResult.block) {
+      throw new Error(preResult.reason ?? "Request blocked by a lifecycle hook.")
+    }
+
+    const startedAt = Date.now()
+    const response = await fetch(input, init)
+    const durationMs = Date.now() - startedAt
     requestSummaries.push({
-      method: (init?.method ?? (typeof input === "object" && "method" in input ? input.method : undefined) ?? "GET").toUpperCase(),
+      method,
       path: url.pathname,
       status: response.status,
       requestId: response.headers.get("Request-Id") ?? response.headers.get("X-Correlation-Id"),
@@ -1068,8 +1130,20 @@ function captureFetch(): typeof fetch {
       tokenCountSource: response.headers.get("SECAPI-Token-Count-Source"),
       cacheHit: response.headers.get("SECAPI-Cache-Hit") === null ? null : response.headers.get("SECAPI-Cache-Hit") === "true",
       maturity: response.headers.get("SECAPI-Maturity"),
-      durationMs: Date.now() - startedAt,
+      durationMs,
     })
+
+    for (const message of runPostRequestHooks(postRequestHooks(), {
+      url: url.toString(),
+      method,
+      status: response.status,
+      durationMs,
+      headers: headersToRecord(response.headers),
+      env: process.env,
+    })) {
+      process.stderr.write(`${message}\n`)
+    }
+
     return response
   }
 }
@@ -1427,7 +1501,7 @@ function defaultClient(credentials: CliCredentials) {
     apiKey: credentials.apiKey,
     bearerToken: credentials.bearerToken,
     baseUrl,
-    fetch: captureFetch(),
+    fetch: captureFetch(credentials.apiKey),
   })
 }
 
@@ -1607,10 +1681,10 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     examples: ["secapi doctor"],
   },
   login: {
-    usage: "secapi login [--profile <name>] [--print]",
-    summary: "Verify your API key and save a no-secret profile that records WHICH env var holds it. Never stores the key.",
-    flags: ["--profile <name>", "--base-url <url>", "--print", STDIN_FLAG_NAME],
-    examples: ["secapi login", "secapi login --print", "secapi --profile prod login"],
+    usage: "secapi login [--profile <name>] [--print] [--paste] [--reonboard]",
+    summary: "Verify your API key and save a no-secret profile that records WHICH env var holds it. Never stores the key. On a real terminal with no key found, prompts for a masked paste; --paste re-prompts even when a key is already set; --reonboard runs the first-run setup wizard.",
+    flags: ["--profile <name>", "--base-url <url>", "--print", "--paste", "--reonboard", STDIN_FLAG_NAME],
+    examples: ["secapi login", "secapi login --print", "secapi login --paste", "secapi login --reonboard", "secapi --profile prod login"],
   },
   me: {
     usage: "secapi me",
@@ -1814,17 +1888,44 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
   },
   "schedule add": {
-    usage: 'secapi schedule add --when "<natural language>" --run "<command>"',
-    summary: "Schedule a secapi command in natural language (local; run via cron/launchd → schedule run-due).",
-    flags: ["--when <text>", "--run <command>"],
-    examples: ['secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL"'],
+    usage: 'secapi schedule add --when "<natural language>" --run "<command>" [--notify-webhook <url>]',
+    summary: "Schedule a secapi command in natural language (local; run via cron/launchd → schedule run-due). Optionally ping a webhook when it completes.",
+    flags: ["--when <text>", "--run <command>", "--notify-webhook <url>"],
+    examples: ['secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL" --notify-webhook https://example.com/hook'],
   },
   "schedule list": { usage: "secapi schedule list", summary: "List scheduled commands.", examples: ["secapi schedule list"] },
   "schedule remove": { usage: "secapi schedule remove <id>", summary: "Remove a scheduled command.", examples: ["secapi schedule remove sch_..."] },
   "schedule run-due": {
-    usage: "secapi schedule run-due",
-    summary: "List schedules due now (wire into cron/launchd). Local-only.",
-    examples: ["secapi schedule run-due"],
+    usage: "secapi schedule run-due [--execute]",
+    summary: "List schedules due now (wire into cron/launchd). With --execute, actually runs each due command and, for any task with a notify webhook, POSTs a redacted job-complete event. Local-only.",
+    flags: ["--execute"],
+    examples: ["secapi schedule run-due", "secapi schedule run-due --execute"],
+  },
+  "layouts save": {
+    usage: 'secapi layouts save --name <name> --run "<command>"',
+    summary: "Save a secapi command (typically a --watch dashboard) under a name for later.",
+    flags: ["--name <name>", "--run <command>"],
+    examples: ['secapi layouts save --name factors-desk --run "factors dashboard --watch"'],
+  },
+  "layouts list": { usage: "secapi layouts list", summary: "List saved dashboard layouts.", examples: ["secapi layouts list"] },
+  "layouts remove": { usage: "secapi layouts remove <name>", summary: "Remove a saved layout.", examples: ["secapi layouts remove factors-desk"] },
+  "layouts run": {
+    usage: "secapi layouts run <name>",
+    summary: "Re-run a saved layout, inheriting your terminal (so --watch dashboards work normally).",
+    examples: ["secapi layouts run factors-desk"],
+  },
+  "memory add": {
+    usage: 'secapi memory add "<note>"',
+    summary: "Remember a short free-text note across sessions (local; never sent to the API).",
+    examples: ['secapi memory add "AAPL earnings call is next Tuesday"'],
+  },
+  "memory list": { usage: "secapi memory list", summary: "List remembered notes.", examples: ["secapi memory list"] },
+  "memory clear": { usage: "secapi memory clear", summary: "Forget all remembered notes.", examples: ["secapi memory clear"] },
+  "bridge telegram": {
+    usage: "secapi bridge telegram --bot-token-env <ENV_VAR_NAME> --allowed-chat-id <id>",
+    summary: "Opt-in remote control: long-polls Telegram and runs non-mutating commands from one allow-listed chat. Local-only; no public webhook.",
+    flags: ["--bot-token-env <name>", "--allowed-chat-id <id>"],
+    examples: ["secapi bridge telegram --bot-token-env TELEGRAM_BOT_TOKEN --allowed-chat-id 123456789"],
   },
   init: {
     usage: "secapi init --client <claude-code|claude-desktop|cursor|windsurf|project> [--print]",
@@ -1857,6 +1958,10 @@ const GROUP_HELP: Record<string, string[]> = {
   billing: ["billing show", "billing quote", "billing budget", "billing checkout", "billing portal"],
   config: ["config show", "config profiles", "config theme"],
   schedule: ["schedule add", "schedule list", "schedule remove", "schedule run-due"],
+  layouts: ["layouts save", "layouts list", "layouts remove", "layouts run"],
+  memory: ["memory add", "memory list", "memory clear"],
+  bridge: ["bridge telegram"],
+  skills: ["skills list", "skills run"],
   diagnostics: ["doctor", "diagnostics request", "diagnostics deliveries-summary"],
   entities: ["entities resolve"],
   factors: ["factors exposures", "factors valuations"],
@@ -1899,6 +2004,7 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "billing portal",
   "billing quote",
   "billing show",
+  "bridge telegram",
   "companies balance-sheets",
   "companies cash-flow-statements",
   "companies financials",
@@ -1978,6 +2084,13 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "schedule list",
   "schedule remove",
   "schedule run-due",
+  "layouts save",
+  "layouts list",
+  "layouts remove",
+  "layouts run",
+  "memory add",
+  "memory list",
+  "memory clear",
   "macro calendar",
   "macro credit-rating",
   "macro credit-ratings",
@@ -1991,6 +2104,12 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "me",
   "model-portfolios factor-view",
   "models factor-analysis",
+  "monitors create",
+  "monitors delete",
+  "monitors get",
+  "monitors list",
+  "monitors matches",
+  "news",
   "observability export",
   "observability show",
   "offerings list",
@@ -2006,6 +2125,8 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "search semantic",
   "sections get",
   "sections search",
+  "skills list",
+  "skills run",
   "statements get",
   "stocks loadings",
   "strategies factor-rotation",
@@ -2014,6 +2135,7 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
   "streams create",
   "streams events",
   "streams list",
+  "streams watch",
   "traces get",
   "traces list",
   "usage show",
@@ -2027,6 +2149,7 @@ const IMPLEMENTED_COMMAND_KEYS = new Set([
 const EXTRA_KNOWN_OPTION_FLAGS = [
   "--accession-number",
   "--action-type",
+  "--allowed-chat-id",
   "--api-key",
   "--approval-threshold-cents",
   "--artifact-id",
@@ -2037,6 +2160,7 @@ const EXTRA_KNOWN_OPTION_FLAGS = [
   "--benchmark-label",
   "--body-file",
   "--body-json",
+  "--bot-token-env",
   "--base-url",
   "--cancel-url",
   "--candidates",
@@ -2061,8 +2185,10 @@ const EXTRA_KNOWN_OPTION_FLAGS = [
   "--dry-run",
   "--effective-date-from",
   "--effective-date-to",
+  "--email",
   "--event-id",
   "--event-types",
+  "--execute",
   "--execution-date-from",
   "--execution-date-to",
   "--expand",
@@ -2083,6 +2209,7 @@ const EXTRA_KNOWN_OPTION_FLAGS = [
   "--form",
   "--form-type",
   "--format",
+  "--forms",
   "--frequency",
   "--hedge-file",
   "--hedge-json",
@@ -2108,6 +2235,7 @@ const EXTRA_KNOWN_OPTION_FLAGS = [
   "--limit",
   "--live",
   "--lookback",
+  "--max-events",
   "--max-hedges",
   "--maxHedges",
   "--meeting-type",
@@ -2123,7 +2251,9 @@ const EXTRA_KNOWN_OPTION_FLAGS = [
   "--model-file",
   "--model-id",
   "--model-json",
+  "--monitor-id",
   "--name",
+  "--notify-webhook",
   "--objective",
   "--offering-type",
   "--optimizer-file",
@@ -2187,6 +2317,7 @@ const EXTRA_KNOWN_OPTION_FLAGS = [
   "--version",
   "--view",
   "--webhook-id",
+  "--webhook-url",
   "--what-if-holdings-file",
   "--what-if-holdings-json",
   "--what-if-label",
@@ -2222,7 +2353,7 @@ function printCommandHelp(key: string, help: CommandHelp) {
       "Optional --accent #rrggbb is saved with the theme.",
       "A global --theme before other commands applies for that run only; prefixing config theme does not save settings.",
     )
-  } else if (!["agent-context", "completion", "config profiles", "config show", "config theme", "examples", "health", "login", "schedule add", "schedule list", "schedule remove", "schedule run-due"].includes(key)) {
+  } else if (!["agent-context", "completion", "config profiles", "config show", "config theme", "examples", "health", "login", "schedule add", "schedule list", "schedule remove", "schedule run-due", "layouts save", "layouts list", "layouts remove", "layouts run", "memory add", "memory list", "memory clear", "bridge telegram", "skills list", "skills run"].includes(key)) {
     lines.push("", "Authentication: set SECAPI_API_KEY, SECAPI_OPERATOR_API_KEY, SECAPI_BEARER_TOKEN, or use a documented stdin credential flag when the command calls the API.")
   }
   process.stdout.write(`${lines.join("\n")}\n`)
@@ -2470,10 +2601,30 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "facts get": { requiredFlags: ["--tag"], examples: ["secapi facts get --ticker AAPL --tag Revenues --taxonomy us-gaap"] },
   health: { auth: "none", examples: ["secapi health"] },
   login: { auth: "optional_api_key", mutates: true, output: "json", examples: ["secapi login", "secapi login --print"] },
-  "schedule add": { auth: "none", mutates: true, output: "json", requiredFlags: ["--when", "--run"], examples: ['secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL"'] },
+  "schedule add": { auth: "none", mutates: true, output: "json", requiredFlags: ["--when", "--run"], examples: ['secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL" --notify-webhook https://example.com/hook'] },
   "schedule list": { auth: "none", output: "json", examples: ["secapi schedule list"] },
   "schedule remove": { auth: "none", mutates: true, output: "json", examples: ["secapi schedule remove sch_..."] },
-  "schedule run-due": { auth: "none", output: "json", examples: ["secapi schedule run-due"] },
+  // mutates: true because --execute re-spawns whatever command was scheduled
+  // (potentially mutating) — the same bridge-bypass class of risk `layouts
+  // run` has, and the same fix: this must never look safe to run remotely.
+  "schedule run-due": { auth: "none", mutates: true, output: "json", examples: ["secapi schedule run-due", "secapi schedule run-due --execute"] },
+  "layouts save": { auth: "none", mutates: true, output: "json", requiredFlags: ["--name", "--run"], examples: ['secapi layouts save --name factors-desk --run "factors dashboard --watch"'] },
+  "layouts list": { auth: "none", output: "json", examples: ["secapi layouts list"] },
+  "layouts remove": { auth: "none", mutates: true, output: "json", examples: ["secapi layouts remove factors-desk"] },
+  // Mutates local state (it can re-spawn ANY stored command, mutating or not) —
+  // this is also the Telegram bridge's safety boundary: `mutates: true` is what
+  // stops the bridge from ever indirectly running a mutating command through a
+  // saved layout (Codex review, PR #1204).
+  "layouts run": { auth: "none", mutates: true, output: "json", examples: ["secapi layouts run factors-desk"] },
+  "memory add": { auth: "none", mutates: true, output: "json", examples: ['secapi memory add "AAPL earnings call is next Tuesday"'] },
+  "memory list": { auth: "none", output: "json", examples: ["secapi memory list"] },
+  "memory clear": { auth: "none", mutates: true, output: "json", examples: ["secapi memory clear"] },
+  "bridge telegram": {
+    auth: "none",
+    output: "text",
+    requiredFlags: ["--bot-token-env", "--allowed-chat-id"],
+    examples: ["secapi bridge telegram --bot-token-env TELEGRAM_BOT_TOKEN --allowed-chat-id 123456789"],
+  },
   init: { auth: "optional_api_key", mutates: true, output: "file_or_text", requiredFlags: ["--client"], examples: ["secapi init --client cursor --print"] },
   "intelligence company": { requiredFlags: ["--ticker|--cik"], examples: ["secapi intelligence company --ticker AAPL --view compact"] },
   "intelligence earnings-preview": { requiredFlags: ["--ticker|--cik"], examples: ["secapi intelligence earnings-preview --ticker AAPL --view compact"] },
@@ -2493,6 +2644,10 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "mcp install": { auth: "optional_api_key", mutates: true, output: "file_or_text", requiredFlags: ["--client"], examples: ["secapi mcp install --client claude-code"] },
   "model-portfolios factor-view": { requiredFlags: ["--portfolio-id"], examples: ["secapi model-portfolios factor-view --portfolio-id mp_... --response-mode compact"] },
   "models factor-analysis": { requiredFlags: ["--holdings-json|--holdings-file"], examples: ["secapi models factor-analysis --holdings-file holdings.json --model-id growth-core"] },
+  "monitors create": { mutates: true, requiredFlags: ["--name", "--query"], examples: ["secapi monitors create --name \"8-K risk mentions\" --query \"material weakness\" --email you@example.com"] },
+  "monitors delete": { mutates: true, requiredFlags: ["--monitor-id"], examples: ["secapi monitors delete --monitor-id mon_..."] },
+  "monitors get": { requiredFlags: ["--monitor-id"], examples: ["secapi monitors get --monitor-id mon_..."] },
+  "monitors matches": { requiredFlags: ["--monitor-id"], examples: ["secapi monitors matches --monitor-id mon_... --limit 10"] },
   "owners 13f": { requiredFlags: ["--cik"], examples: ["secapi owners 13f --cik 0001067983 --limit 25"] },
   "owners compare-13f": { requiredFlags: ["--cik"], examples: ["secapi owners compare-13f --cik 0001067983"] },
   "portfolio analyze": { requiredFlags: ["--holdings-json|--holdings-file"], examples: ["secapi portfolio analyze --holdings-file holdings.json --benchmark-label SPY --benchmark-holdings-file benchmark.json --keys VALUE,QUALITY"] },
@@ -2504,11 +2659,19 @@ const AGENT_CONTEXT_COMMAND_OVERRIDES: Record<string, AgentContextCommandOverrid
   "search semantic": { requiredFlags: ["--q|--query"], examples: ["secapi search semantic --q \"supplier concentration\" --mode hybrid --view agent"] },
   "sections get": { requiredFlags: ["--ticker|--cik", "--section"], examples: ["secapi sections get --ticker AAPL --form 10-K --section item_1a --view agent"] },
   "sections search": { requiredFlags: ["--q|--query"], examples: ["secapi sections search --ticker AAPL --q risk --form 10-K"] },
+  "skills list": { auth: "none", examples: ["secapi skills list"] },
+  "skills run": {
+    auth: "none",
+    output: "text",
+    requiredFlags: ["<slug>"],
+    examples: ["secapi skills run due-diligence AAPL"],
+  },
   "statements get": { requiredFlags: ["--ticker|--cik"], examples: ["secapi statements get --ticker AAPL --statement all --period annual --limit 1"] },
   "stocks loadings": { requiredFlags: ["--ticker"], examples: ["secapi stocks loadings --ticker AAPL --keys VALUE,QUALITY"] },
   "support bundle": { mutates: false, examples: ["secapi support bundle --request-id req_..."] },
   "streams create": { mutates: true, examples: ["secapi streams create --event-types artifact.created --transport poll"] },
   "streams events": { requiredFlags: ["--stream-id"], examples: ["secapi streams events --stream-id strm_... --limit 10"] },
+  "streams watch": { requiredFlags: ["--stream-id"], examples: ["secapi streams watch --stream-id strm_... --forms 10-K,8-K --max-events 5"] },
   "traces get": { requiredFlags: ["--trace-id"], examples: ["secapi traces get --trace-id trc_..."] },
   "traces list": { requiredFlags: ["--ids"], examples: ["secapi traces list --ids trc_1,trc_2"] },
   "usage show": { output: "human_or_json", examples: ["secapi usage show", "secapi usage show --json=false"] },
@@ -2852,12 +3015,7 @@ function renderCompletionScript(shellArg?: string) {
 }
 
 function commandKeyForCurrentArgs() {
-  const tokens = args.filter((arg) => !arg.startsWith("-")).slice(0, 3)
-  for (let length = tokens.length; length >= 1; length--) {
-    const key = tokens.slice(0, length).join(" ")
-    if (IMPLEMENTED_COMMAND_KEYS.has(key)) return key
-  }
-  return undefined
+  return commandKeyFor(args)
 }
 
 function formatErrorForCurrentCommand(error: unknown) {
@@ -2964,6 +3122,9 @@ async function launchInteractive() {
 async function runLogin() {
   const stdin = hasFlag(STDIN_FLAG_NAME)
   const wantPrint = hasFlag("--print") || hasFlag("--dry-run")
+  const reonboard = hasFlag("--reonboard")
+  const forcePrompt = hasFlag("--paste") || reonboard
+  const isTty = process.stdout.isTTY === true && process.stdin.isTTY === true
   const selectedProfile = activeProfileName()
   const targetProfileName = selectedProfile?.value?.trim() || undefined
   const profileName = targetProfileName ? safeProfileName(targetProfileName, selectedProfile?.source ?? "profile name") : undefined
@@ -2976,12 +3137,15 @@ async function runLogin() {
     stdin,
     baseUrl,
     defaultBaseUrl: "https://api.secapi.ai",
+    isTty,
+    forcePrompt,
   })
 
   if (wantPrint) {
     print({
       object: "secapi_cli_login",
       dryRun: true,
+      mode: plan.mode,
       profile: plan.profile,
       apiKeyEnv: plan.apiKeyEnv,
       baseUrl: plan.baseUrl ?? null,
@@ -2990,7 +3154,29 @@ async function runLogin() {
     return
   }
 
-  const apiKey = stdin ? await readCredentialFromStdin(STDIN_FLAG_NAME) : envCredential(...API_KEY_ENV_NAMES) ?? envNameValue(targetProfile?.apiKeyEnv)?.value
+  if (reonboard) {
+    process.stderr.write("Welcome to SEC API — let's get you set up.\n\n")
+  }
+
+  // human/paste: nothing usable was found in the environment (or the user
+  // explicitly asked to re-paste), and we're on a real terminal — prompt for
+  // the key ourselves rather than erroring. The pasted value verifies via
+  // me() below but is NEVER written to disk; only the env-var name is.
+  const pastedKey = plan.mode === "human" || plan.mode === "paste"
+    ? await maskedPrompt(
+      plan.mode === "human"
+        ? "No API key found in the environment. Paste your SEC API key to verify and continue (never saved to disk; get one at https://secapi.ai/app/api-keys): "
+        : "Paste your SEC API key to re-verify (never saved to disk): ",
+      // stdout must stay the pure JSON result channel — the prompt text and
+      // '*' mask characters go to stderr, same as every other REPL/status line.
+      { output: process.stderr as unknown as NodeJS.WriteStream },
+    )
+    : undefined
+  if (pastedKey === "") throw new Error("Login cancelled.")
+
+  const apiKey = stdin
+    ? await readCredentialFromStdin(STDIN_FLAG_NAME)
+    : pastedKey ?? envCredential(...API_KEY_ENV_NAMES) ?? envNameValue(targetProfile?.apiKeyEnv)?.value
   if (!apiKey) throw new Error(NO_KEY_MESSAGE)
 
   const principal = await defaultClient({ apiKey }).me()
@@ -2999,6 +3185,7 @@ async function runLogin() {
   print({
     object: "secapi_cli_login",
     verified: true,
+    mode: plan.mode,
     profile: plan.profile,
     apiKeyEnv: plan.apiKeyEnv,
     configPath,
@@ -3009,16 +3196,27 @@ async function runLogin() {
       billingState: fieldString(who, "billingState"),
     },
     next:
-      stdin && plan.apiKeyEnv === "SECAPI_API_KEY"
+      (stdin || pastedKey !== undefined) && plan.apiKeyEnv === "SECAPI_API_KEY"
         ? "Add the key to your shell so it persists: export SECAPI_API_KEY=<your key>"
         : `Profile '${plan.profile}' reads your key from $${plan.apiKeyEnv}.`,
   })
+
+  if (reonboard) {
+    process.stderr.write([
+      "",
+      "You're set up. A few things worth doing next:",
+      "  secapi doctor            — confirm base URL, auth, and health all look right",
+      "  secapi config theme      — pick a color theme (terminal, lights-out, xai, ...)",
+      "  secapi init              — one-command MCP install for your agent client",
+      "",
+    ].join("\n"))
+  }
 }
 
 // `secapi schedule` — natural-language scheduled commands (Grok /schedule). The
 // CLI persists schedules; `schedule run-due --execute` is meant to be invoked by
 // the OS scheduler (cron/launchd). Local-only except run-due --execute.
-function runSchedule(sub: string) {
+async function runSchedule(sub: string) {
   const home = homedir()
   if (sub === "add") {
     const when = getStringFlag("--when")
@@ -3026,17 +3224,19 @@ function runSchedule(sub: string) {
     if (!when || !run) throw new Error('Usage: secapi schedule add --when "every weekday 7am" --run "filings latest --ticker AAPL"')
     const spec = parseSchedule(when)
     if (!spec) throw new Error(`Could not understand schedule "${when}". Try "every weekday 7am", "daily 9:30am", "every monday 8am", "hourly", or "every 15 minutes".`)
+    const notifyWebhookUrl = getFlag("--notify-webhook")
     const task: ScheduledTask = {
       id: `sch_${Date.now().toString(36)}`,
       command: run,
       spec,
       description: describeSpec(spec),
       createdAt: new Date().toISOString(),
+      ...(notifyWebhookUrl ? { notifyWebhookUrl } : {}),
     }
     const tasks = loadSchedules(process.env, home)
     tasks.push(task)
     const path = saveSchedules(process.env, home, tasks)
-    print({ object: "secapi_cli_schedule", added: task.id, command: task.command, schedule: task.description, path })
+    print({ object: "secapi_cli_schedule", added: task.id, command: task.command, schedule: task.description, notifyWebhookUrl: notifyWebhookUrl ?? null, path })
     return
   }
   if (sub === "list") {
@@ -3060,15 +3260,238 @@ function runSchedule(sub: string) {
     if (dueIds.size > 0) {
       saveSchedules(process.env, home, tasks.map((task) => (dueIds.has(task.id) ? { ...task, lastRunMs: now } : task)))
     }
+    // --execute is opt-in: default behavior (list only) is unchanged, so
+    // existing cron/launchd setups that pipe the `due` list elsewhere keep
+    // working exactly as before.
+    if (!hasFlag("--execute")) {
+      print({
+        object: "secapi_cli_schedule_due",
+        now: new Date(now).toISOString(),
+        due: due.map((t) => ({ id: t.id, command: t.command, schedule: t.description })),
+        note: due.length === 0 ? "Nothing due." : "Run each command, or wire `secapi schedule run-due` into cron/launchd.",
+      })
+      return
+    }
+    const forwardedArgs = buildForwardedGlobalArgs()
+    const results = []
+    for (const task of due) {
+      const startedAt = Date.now()
+      const result = await runCommand(task.command, {
+        selfExec: process.execPath,
+        selfEntry: process.argv[1] ?? "",
+        forwardedArgs,
+        rich: false,
+      })
+      const durationMs = Date.now() - startedAt
+      const ok = result.code === 0
+      const output = ok ? result.stdout.trim() : result.stderr.trim()
+      results.push({ id: task.id, command: task.command, ok, durationMs })
+      if (task.notifyWebhookUrl) {
+        try {
+          await fetch(task.notifyWebhookUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(buildScheduleNotifyPayload(task, { ok, durationMs, output })),
+          })
+        } catch (error) {
+          process.stderr.write(`notify webhook failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}\n`)
+        }
+      }
+    }
     print({
-      object: "secapi_cli_schedule_due",
+      object: "secapi_cli_schedule_executed",
       now: new Date(now).toISOString(),
-      due: due.map((t) => ({ id: t.id, command: t.command, schedule: t.description })),
-      note: due.length === 0 ? "Nothing due." : "Run each command, or wire `secapi schedule run-due` into cron/launchd.",
+      executed: results,
     })
+    // A cron/launchd caller checks the exit code, not the JSON body — a
+    // failed scheduled command must not look like a successful run
+    // (Codex review, PR #1207).
+    if (results.some((r) => !r.ok)) process.exitCode = 1
     return
   }
   throw new Error("Usage: secapi schedule <add|list|remove|run-due>")
+}
+
+function runLayouts(sub: string) {
+  const home = homedir()
+  if (sub === "save") {
+    const name = getFlag("--name")
+    const command = getFlag("--run")
+    if (!name || !command) throw new Error('Usage: secapi layouts save --name <name> --run "factors dashboard --watch"')
+    const layouts = loadLayouts(process.env, home).filter((l) => l.name !== name)
+    layouts.push({ id: `lay_${Date.now().toString(36)}`, name, command, createdAt: new Date().toISOString() })
+    const path = saveLayouts(process.env, home, layouts)
+    print({ object: "secapi_cli_layout", saved: name, command, path })
+    return
+  }
+  if (sub === "list") {
+    print({ object: "secapi_cli_layouts", layouts: loadLayouts(process.env, home) })
+    return
+  }
+  if (sub === "remove") {
+    const nameOrId = args[2]
+    if (!nameOrId) throw new Error("Usage: secapi layouts remove <name>")
+    const layouts = loadLayouts(process.env, home)
+    const next = layouts.filter((l) => l.name !== nameOrId && l.id !== nameOrId)
+    saveLayouts(process.env, home, next)
+    print({ object: "secapi_cli_layout", removed: nameOrId, remaining: next.length })
+    return
+  }
+  if (sub === "run") {
+    const nameOrId = args[2]
+    if (!nameOrId) throw new Error("Usage: secapi layouts run <name>")
+    const layout = findLayout(loadLayouts(process.env, home), nameOrId)
+    if (!layout) throw new Error(`No saved layout named "${nameOrId}". Run 'secapi layouts list' to see saved layouts.`)
+    // Inherit stdio so a --watch dashboard gets direct TTY access, same as if
+    // the user had typed the command themselves.
+    const result = spawnSync(process.execPath, [process.argv[1] ?? "", ...tokenizeCommand(layout.command)], { stdio: "inherit" })
+    process.exitCode = result.status ?? 1
+    return
+  }
+  throw new Error("Usage: secapi layouts <save|list|remove|run>")
+}
+
+function runMemory(sub: string) {
+  const home = homedir()
+  if (sub === "add") {
+    const text = args[2]
+    if (!text || text.startsWith("-")) throw new Error('Usage: secapi memory add "note text"')
+    const notes = loadMemory(process.env, home)
+    notes.push({ id: `mem_${Date.now().toString(36)}`, text, createdAt: new Date().toISOString() })
+    const path = saveMemory(process.env, home, notes)
+    print({ object: "secapi_cli_memory_note", added: text, path })
+    return
+  }
+  if (sub === "list") {
+    print({ object: "secapi_cli_memory", notes: loadMemory(process.env, home) })
+    return
+  }
+  if (sub === "clear") {
+    const path = saveMemory(process.env, home, [])
+    print({ object: "secapi_cli_memory", cleared: true, path })
+    return
+  }
+  throw new Error("Usage: secapi memory <add|list|clear>")
+}
+
+/** Resolves the longest known command key from a raw token list — the same
+ * 3/2/1-token-prefix rule commandKeyForCurrentArgs() uses for the CLI's own
+ * argv, parameterized so the Telegram bridge can classify a message's text. */
+function commandKeyFor(rawTokens: string[]) {
+  const tokens = rawTokens.filter((arg) => !arg.startsWith("-")).slice(0, 3)
+  for (let length = tokens.length; length >= 1; length--) {
+    const key = tokens.slice(0, length).join(" ")
+    if (IMPLEMENTED_COMMAND_KEYS.has(key)) return key
+  }
+  return undefined
+}
+
+/** Fail CLOSED: an unrecognized command is never allowed remotely, only a
+ * confirmed-non-mutating known command is. This is the bridge's entire safety
+ * boundary — it must never become a way to spend money or change state. */
+function isBridgeCommandBlocked(tokens: string[]): boolean {
+  const key = commandKeyFor(tokens)
+  if (!key) return true
+  return agentContextCommandDetail(key).mutates
+}
+
+async function runTelegramBridge() {
+  const tokenEnvName = getFlag("--bot-token-env")
+  const allowedChatIdRaw = getFlag("--allowed-chat-id")
+  if (!tokenEnvName || !allowedChatIdRaw) {
+    throw new Error("Usage: secapi bridge telegram --bot-token-env <ENV_VAR_NAME> --allowed-chat-id <id>")
+  }
+  if (tokenEnvName.includes(":") || looksCredentialShaped(tokenEnvName)) {
+    throw new Error("--bot-token-env must be the NAME of an environment variable (e.g. TELEGRAM_BOT_TOKEN), never the token itself.")
+  }
+  const botToken = process.env[tokenEnvName]?.trim()
+  if (!botToken) throw new Error(`Environment variable ${tokenEnvName} is not set. Set it to your Telegram bot token before running the bridge.`)
+  const allowedChatId = Number(allowedChatIdRaw)
+  if (!Number.isFinite(allowedChatId)) throw new Error("--allowed-chat-id must be a number.")
+
+  const forwardedArgs = buildForwardedGlobalArgs()
+  process.stderr.write(
+    `Telegram bridge started — only chat ${allowedChatId} is allowed; mutating or unrecognized commands are refused. Ctrl+C to stop.\n`,
+  )
+
+  let stopped = false
+  process.once("SIGINT", () => {
+    stopped = true
+  })
+
+  const deps: BridgeDeps = {
+    fetchUpdates: async (offset) => {
+      const url = new URL(telegramApiUrl(botToken, "getUpdates"))
+      url.searchParams.set("timeout", "25")
+      if (offset !== undefined) url.searchParams.set("offset", String(offset))
+      const response = await fetch(url)
+      const body = (await response.json()) as { ok: boolean; result?: TelegramUpdate[] }
+      return body.ok && body.result ? body.result : []
+    },
+    sendMessage: async (chatId, text) => {
+      await fetch(telegramApiUrl(botToken, "sendMessage"), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+      })
+    },
+    runCommand: (tokens) =>
+      runCommand(tokens.join(" "), {
+        selfExec: process.execPath,
+        selfEntry: process.argv[1] ?? "",
+        forwardedArgs,
+        rich: false,
+      }),
+    isBlocked: isBridgeCommandBlocked,
+    allowedChatId,
+    writeLog: (line) => process.stderr.write(`${line}\n`),
+  }
+
+  let offset: number | undefined
+  while (!stopped) {
+    try {
+      offset = await pollOnce(offset, deps)
+    } catch (error) {
+      process.stderr.write(`bridge error: ${error instanceof Error ? error.message : String(error)}\n`)
+      await new Promise((resolve) => setTimeout(resolve, 3000))
+    }
+  }
+}
+
+/**
+ * Semantic NDJSON event stream for `secapi skills run` (Phase 5.6) — the
+ * one-shot, agent/script-facing counterpart to the REPL's `/skill --run`
+ * Markdown memo. Each of the skill's steps emits step_start/tool_use/text/
+ * step_finish, one self-describing JSON object per line on stdout, so a
+ * calling program can follow along without waiting for the whole run.
+ */
+async function runSkillNdjson(shortcut: SkillShortcut, arg: string) {
+  const steps = expandSkill(shortcut, arg)
+  const forwardedArgs = buildForwardedGlobalArgs()
+  const emit = (event: Record<string, unknown>) => {
+    process.stdout.write(`${JSON.stringify(event)}\n`)
+  }
+  let anyFailed = false
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index]
+    emit({ event: "step_start", index, total: steps.length, label: step.label, metered: step.metered })
+    emit({ event: "tool_use", index, command: step.command })
+    const startedAt = Date.now()
+    const result = await runCommand(step.command.replace(/^secapi\s+/, ""), {
+      selfExec: process.execPath,
+      selfEntry: process.argv[1] ?? "",
+      forwardedArgs,
+      rich: false,
+    })
+    const durationMs = Date.now() - startedAt
+    const ok = result.code === 0
+    if (!ok) anyFailed = true
+    emit({ event: "text", index, text: ok ? result.stdout.trim() : result.stderr.trim() })
+    emit({ event: "step_finish", index, ok, durationMs })
+  }
+  // A scripted consumer of this NDJSON stream shouldn't have to parse every
+  // event just to know the run failed (Codex review, PR #1207).
+  if (anyFailed) process.exitCode = 1
 }
 
 async function main() {
@@ -3175,7 +3598,49 @@ async function main() {
   }
 
   if (group === "schedule") {
-    runSchedule(command)
+    await runSchedule(command)
+    return
+  }
+
+  if (group === "layouts") {
+    runLayouts(command)
+    return
+  }
+
+  if (group === "memory") {
+    runMemory(command)
+    return
+  }
+
+  if (group === "bridge" && command === "telegram") {
+    await runTelegramBridge()
+    return
+  }
+
+  if (group === "skills" && command === "list") {
+    print({
+      object: "list",
+      data: SKILL_SHORTCUTS.map((shortcut) => ({
+        object: "skill_shortcut",
+        slash: shortcut.slash,
+        title: shortcut.title,
+        summary: shortcut.summary,
+        arg: shortcut.arg,
+        metered: skillIsMetered(shortcut),
+        steps: shortcut.steps.map((step) => ({ label: step.label, command: step.command, metered: step.metered === true })),
+      })),
+    })
+    return
+  }
+
+  if (group === "skills" && command === "run") {
+    const slug = args[2]
+    if (!slug || slug.startsWith("-")) throw new Error("Usage: secapi skills run <slug> [<arg>]")
+    const shortcut = findSkillShortcut(slug)
+    if (!shortcut) throw new Error(`Unknown skill shortcut "${slug}". Run 'secapi skills list' to see available shortcuts.`)
+    const arg = args[3] && !args[3].startsWith("-") ? args[3] : ""
+    if (shortcut.arg !== "none" && !arg) throw new Error(`Usage: secapi skills run ${slug} <${shortcut.arg}>`)
+    await runSkillNdjson(shortcut, arg)
     return
   }
 
@@ -3635,6 +4100,101 @@ async function main() {
     return
   }
 
+  if (group === "streams" && command === "watch") {
+    const streamId = getFlag("--stream-id")
+    if (!streamId) throw new Error("--stream-id is required (create one first: secapi streams create --transport websocket)")
+    if (hasRawFlag("--output")) {
+      throw new Error("secapi streams watch does not support --output (it's a live tail, not a single value) — pipe stdout instead")
+    }
+    await runStreamWatch({
+      streamId,
+      forms: getListFlag("--forms"),
+      tickers: getListFlag("--tickers"),
+      maxEvents: getNumberFlag("--max-events"),
+      rich: renderRich,
+      theme: activeTheme,
+      write: (line) => process.stdout.write(`${line}\n`),
+      writeError: (line) => process.stderr.write(`${line}\n`),
+      openStream: (id, forms, tickers, callbacks) => {
+        const stream = apiClient.streamFilings({
+          streamId: id,
+          forms,
+          tickers,
+          onFiling: callbacks.onFiling,
+          onConnected: callbacks.onConnected,
+          onRateLimited: callbacks.onRateLimited,
+          onError: callbacks.onError,
+        })
+        return { close: () => stream.close() }
+      },
+    })
+    return
+  }
+
+  if (group === "monitors" && command === "create") {
+    const name = getFlag("--name")
+    const query = getFlag("--query") ?? getFlag("--q")
+    if (!name || !query) throw new Error("Usage: secapi monitors create --name <name> --query <query> [--webhook-url <url>] [--email <address>]")
+    const email = getFlag("--email")
+    const webhookUrl = getFlag("--webhook-url")
+    const body = {
+      name,
+      query,
+      searchMode: "keyword" as const,
+      ...(webhookUrl ? { webhookUrl } : {}),
+      ...(email ? { delivery: { type: "email" as const, config: { to: email } } } : {}),
+    }
+    if (wantsDryRun) {
+      mutationDryRun("monitors create", { method: "POST", path: "/v1/monitors", body })
+      return
+    }
+    renderer.resource("monitors", await apiClient.createMonitor(body))
+    return
+  }
+
+  if (group === "monitors" && command === "list") {
+    renderer.resource("monitors", await apiClient.listMonitors({ limit: getNumberFlag("--limit") }))
+    return
+  }
+
+  if (group === "monitors" && command === "get") {
+    const monitorId = getFlag("--monitor-id")
+    if (!monitorId) throw new Error("--monitor-id is required")
+    renderer.resource("monitors", await apiClient.getMonitor(monitorId))
+    return
+  }
+
+  if (group === "monitors" && command === "delete") {
+    const monitorId = getFlag("--monitor-id")
+    if (!monitorId) throw new Error("--monitor-id is required")
+    if (wantsDryRun) {
+      mutationDryRun("monitors delete", { method: "DELETE", path: `/v1/monitors/${monitorId}` })
+      return
+    }
+    print(await apiClient.deleteMonitor(monitorId))
+    return
+  }
+
+  if (group === "monitors" && command === "matches") {
+    const monitorId = getFlag("--monitor-id")
+    if (!monitorId) throw new Error("--monitor-id is required")
+    print(await apiClient.monitorMatches(monitorId, {
+      cursor: getFlag("--cursor"),
+      limit: getNumberFlag("--limit"),
+    }))
+    return
+  }
+
+  if (group === "news") {
+    renderer.resource("news", await apiClient.newsStories({
+      ticker: getFlag("--ticker"),
+      cik: getFlag("--cik"),
+      q: getFlag("--q") ?? getFlag("--query"),
+      limit: getNumberFlag("--limit"),
+    }))
+    return
+  }
+
   if (group === "entities" && command === "resolve") {
     print(await apiClient.resolveEntity({
       ticker: getFlag("--ticker"),
@@ -3654,7 +4214,7 @@ async function main() {
   if (group === "traces" && command === "get") {
     const traceId = getFlag("--trace-id") ?? args[2]
     if (!traceId || traceId.startsWith("--")) throw new Error("--trace-id is required")
-    print(await apiClient.getTrace(traceId))
+    renderer.resource("trace", await apiClient.getTrace(traceId))
     return
   }
 
@@ -3701,7 +4261,7 @@ async function main() {
   if (group === "search" && command === "fulltext") {
     const q = getFlag("--q") ?? getFlag("--query")
     if (!q) throw new Error("--q or --query is required")
-    print(await apiClient.searchFulltext({
+    renderer.resource("search", await apiClient.searchFulltext({
       q,
       ticker: getFlag("--ticker"),
       cik: getFlag("--cik"),
@@ -3714,7 +4274,7 @@ async function main() {
   if (group === "search" && command === "semantic") {
     const q = getFlag("--q") ?? getFlag("--query")
     if (!q) throw new Error("--q or --query is required")
-    print(await apiClient.semanticSearch({
+    renderer.resource("citations", await apiClient.semanticSearch({
       q,
       ticker: getFlag("--ticker"),
       cik: getFlag("--cik"),
@@ -4027,7 +4587,7 @@ async function main() {
   if (group === "dilution" && command === "score") {
     const ticker = getFlag("--ticker")
     if (!ticker) throw new Error("Usage: secapi dilution score --ticker <symbol> [--view agent]")
-    print(await apiClient.dilutionScore({ ticker, view: getResponseViewFlag() }))
+    renderer.resource("dilution", await apiClient.dilutionScore({ ticker, view: getResponseViewFlag() }))
     return
   }
 
@@ -4152,7 +4712,7 @@ async function main() {
   }
 
   if (group === "macro" && command === "regimes") {
-    print(await apiClient.macroRegimes({
+    renderer.resource("macroRegime", await apiClient.macroRegimes({
       country: getFlag("--country"),
       lookback: getFlag("--lookback"),
       ...macroResponseParams(),
@@ -4282,7 +4842,7 @@ async function main() {
   }
 
   if (group === "factors" && command === "dashboard") {
-    print(await apiClient.factorDashboard({
+    renderer.resource("factorDashboard", await apiClient.factorDashboard({
       country: getFlag("--country"),
       category: getFlag("--category"),
       window: getFlag("--window"),
@@ -4307,7 +4867,7 @@ async function main() {
   }
 
   if (group === "factors" && command === "extreme-moves") {
-    print(await apiClient.factorExtremeMoves({
+    renderer.resource("extremeMoves", await apiClient.factorExtremeMoves({
       keys: getListFlag("--keys"),
       category: getFlag("--category"),
       window: getFlag("--window"),
@@ -4512,7 +5072,7 @@ async function main() {
 
   // --- Portfolio factor workflow commands ---
   if (group === "portfolio" && command === "analyze") {
-    print(await apiClient.portfolioAnalyze({
+    renderer.resource("portfolio", await apiClient.portfolioAnalyze({
       ...portfolioWorkflowBody(),
       benchmarkLabel: getFlag("--benchmark-label"),
       benchmarkHoldings: getArrayInput("--benchmark-holdings-json", "--benchmark-holdings-file", "benchmark holdings") as any,
@@ -4533,7 +5093,7 @@ async function main() {
   }
 
   if (group === "portfolio" && command === "hedge") {
-    print(await apiClient.portfolioHedge({
+    renderer.resource("portfolio", await apiClient.portfolioHedge({
       ...portfolioWorkflowBody(),
       objective: getPortfolioObjectiveFlag(),
       mode: getPortfolioHedgeModeFlag(),
@@ -4543,7 +5103,7 @@ async function main() {
   }
 
   if (group === "portfolio" && command === "optimize") {
-    print(await apiClient.portfolioOptimize({
+    renderer.resource("portfolio", await apiClient.portfolioOptimize({
       ...portfolioWorkflowBody(),
       objective: getPortfolioObjectiveFlag(),
       maxHedges: getNumberFlag("--max-hedges") ?? getNumberFlag("--maxHedges"),
@@ -4553,7 +5113,7 @@ async function main() {
   }
 
   if (group === "portfolio" && command === "stress-test") {
-    print(await apiClient.portfolioStressTest({
+    renderer.resource("portfolio", await apiClient.portfolioStressTest({
       ...portfolioWorkflowBody(),
       scenarioKey: getPortfolioScenarioKeyFlag(),
     }, factorResponseParams()))
@@ -4655,7 +5215,7 @@ async function main() {
   if (group === "companies" && command === "financials") {
     const ticker = getFlag("--ticker")
     if (!ticker) throw new Error("--ticker is required")
-    print(await apiClient.companyFinancials({
+    renderer.resource("financials", await apiClient.companyFinancials({
       ticker,
       period: getFlag("--period") as any,
       limit: getNumberFlag("--limit"),

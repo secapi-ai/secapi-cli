@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { render } from "ink"
 import { PassThrough } from "node:stream"
 import React from "react"
-import { askModeResponse, childStderrKind, commandPlan, entriesToLogItems, Repl, shouldTreatAsCancelled } from "./app.tsx"
+import { askModeResponse, childStderrKind, commandPlan, entriesToLogItems, isQuotableInPlanMode, Repl, shouldTreatAsCancelled } from "./app.tsx"
 
 // Injected-stream render (PTY-free, deterministic) proves the REPL mounts and
 // renders its banner + prompt without a real terminal.
@@ -58,6 +58,36 @@ describe("REPL mode helpers", () => {
 
     expect(plan).toContain("machine-readable")
     expect(plan).toContain("may create")
+  })
+
+  test("isQuotableInPlanMode is true only for the intelligence group (the only ai_queries-metered commands)", () => {
+    expect(isQuotableInPlanMode(["intelligence", "company", "--ticker", "AAPL"])).toBe(true)
+    expect(isQuotableInPlanMode(["filings", "latest", "--ticker", "AAPL"])).toBe(false)
+    expect(isQuotableInPlanMode([])).toBe(false)
+  })
+
+  test("plan mode shows a real dollar estimate when a quote is supplied", () => {
+    const plan = commandPlan("intelligence company --ticker AAPL", { amountCents: 250 })
+    expect(plan).toContain("Estimated cost: $2.5000")
+    expect(plan).not.toContain("unavailable")
+  })
+
+  test("plan mode surfaces the budget gate message when the quote includes one", () => {
+    const plan = commandPlan("intelligence company --ticker AAPL", {
+      amountCents: 250,
+      budgetGate: { code: "billing_budget_hard_cap_exceeded", message: "This request would exceed the configured billing hard cap." },
+    })
+    expect(plan).toContain("Budget: This request would exceed the configured billing hard cap.")
+  })
+
+  test("plan mode falls back to an 'unavailable' note for a quotable command when no quote was fetched", () => {
+    const plan = commandPlan("intelligence company --ticker AAPL", null)
+    expect(plan).toContain("Estimated cost: unavailable")
+  })
+
+  test("plan mode omits any cost line entirely for non-quotable commands", () => {
+    const plan = commandPlan("filings latest --ticker AAPL", null)
+    expect(plan).not.toContain("Estimated cost")
   })
 
   test("ask mode blocks execution in this release", () => {
