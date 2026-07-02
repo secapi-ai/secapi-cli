@@ -1,6 +1,6 @@
 {
   "name": "@secapi/cli",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "SEC API CLI for SEC data shaped for investors and agents",
   "type": "module",
   "bin": {
@@ -18,7 +18,7 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@secapi/sdk-js": "^1.0.2",
+    "@secapi/sdk-js": "^1.1.0",
     "@types/node": "^24.10.1",
     "@types/react": "^19.1.6",
     "ink": "^6.0.0",

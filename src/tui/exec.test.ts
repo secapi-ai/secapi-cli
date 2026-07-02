@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { runCommand, tokenizeCommand, type Spawner } from "./exec.ts"
+import { runCommand, runShellCommand, tokenizeCommand, type Spawner } from "./exec.ts"
 
 describe("tokenizeCommand", () => {
   test("splits on whitespace", () => {
@@ -170,5 +170,50 @@ describe("runCommand", () => {
     const res = await runCommand("   ", { selfExec: "n", selfEntry: "e", rich: true, spawner })
     expect(spawned).toBe(false)
     expect(res.code).toBe(0)
+  })
+})
+
+describe("runShellCommand", () => {
+  test("spawns the user's shell with -c <command> (POSIX)", async () => {
+    const calls: Array<{ cmd: string; args: string[] }> = []
+    const spawner: Spawner = async (cmd, args) => {
+      calls.push({ cmd, args })
+      return { stdout: "hi\n", stderr: "", code: 0 }
+    }
+    const res = await runShellCommand("echo hi", { spawner, baseEnv: { SHELL: "/bin/zsh" }, platform: "darwin" })
+    expect(res).toEqual({ stdout: "hi\n", stderr: "", code: 0 })
+    expect(calls[0].cmd).toBe("/bin/zsh")
+    expect(calls[0].args).toEqual(["-c", "echo hi"])
+  })
+
+  test("uses ComSpec/cmd.exe with /c on Windows", async () => {
+    const calls: Array<{ cmd: string; args: string[] }> = []
+    const spawner: Spawner = async (cmd, args) => {
+      calls.push({ cmd, args })
+      return { stdout: "hi\r\n", stderr: "", code: 0 }
+    }
+    await runShellCommand("dir", { spawner, baseEnv: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }, platform: "win32" })
+    expect(calls[0].cmd).toBe("C:\\Windows\\System32\\cmd.exe")
+    expect(calls[0].args).toEqual(["/d", "/s", "/c", "dir"])
+  })
+
+  test("falls back to cmd.exe on Windows when ComSpec is unset", async () => {
+    const calls: Array<{ cmd: string }> = []
+    const spawner: Spawner = async (cmd) => {
+      calls.push({ cmd })
+      return { stdout: "", stderr: "", code: 0 }
+    }
+    await runShellCommand("dir", { spawner, baseEnv: {}, platform: "win32" })
+    expect(calls[0].cmd).toBe("cmd.exe")
+  })
+
+  test("falls back to /bin/sh when $SHELL is unset", async () => {
+    const calls: Array<{ cmd: string }> = []
+    const spawner: Spawner = async (cmd) => {
+      calls.push({ cmd })
+      return { stdout: "", stderr: "", code: 0 }
+    }
+    await runShellCommand("pwd", { spawner, baseEnv: {}, platform: "linux" })
+    expect(calls[0].cmd).toBe("/bin/sh")
   })
 })

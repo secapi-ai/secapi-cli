@@ -19,6 +19,13 @@ export type RenderHint =
   | "search"
   | "account"
   | "trace"
+  | "citations"
+  | "dilution"
+  | "monitors"
+  | "news"
+  | "factorDashboard"
+  | "extremeMoves"
+  | "macroRegime"
 
 export interface Renderer {
   /** Always emits machine-readable JSON (agent-context, --json, examples --json). */

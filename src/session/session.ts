@@ -199,3 +199,34 @@ export function listSessions(env: NodeJS.ProcessEnv, home: string): SessionSumma
 export function latestSessionId(env: NodeJS.ProcessEnv, home: string): string | null {
   return listSessions(env, home)[0]?.id ?? null
 }
+
+/**
+ * `/fork` — branch a session: same transcript entries so far, but a brand-new
+ * id and start time, so subsequent turns append to the fork, never mutating
+ * the source session already saved on disk.
+ */
+export function forkTranscript(source: SessionTranscript, forkedAt = new Date().toISOString()): SessionTranscript {
+  return {
+    object: "secapi_cli_session",
+    id: createSessionId(),
+    startedAt: forkedAt,
+    entries: [...source.entries],
+  }
+}
+
+/**
+ * `/rewind [n]` — drop the last `n` turns (a turn = one prompt entry plus every
+ * entry after it up to the next prompt). `n` defaults to 1; rewinding past the
+ * first turn returns an empty transcript (a fresh session), never throws.
+ */
+export function rewindEntries(entries: SessionEntry[], turns: number): SessionEntry[] {
+  if (!Number.isFinite(turns) || turns <= 0) return entries
+  const promptIndexes: number[] = []
+  entries.forEach((entry, index) => {
+    if (entry.kind === "prompt") promptIndexes.push(index)
+  })
+  if (promptIndexes.length === 0) return entries
+  const keepPrompts = Math.max(0, promptIndexes.length - Math.trunc(turns))
+  if (keepPrompts === 0) return []
+  return entries.slice(0, promptIndexes[keepPrompts])
+}

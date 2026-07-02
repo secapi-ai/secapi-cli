@@ -121,12 +121,45 @@ export interface ScheduledTask {
   description: string
   createdAt: string
   lastRunMs?: number
+  /** Opt-in: POSTed a job-complete event when `schedule run-due --execute` runs this task. */
+  notifyWebhookUrl?: string
 }
 
 /** Is the task due to run at `nowMs` given its last run? */
 export function isDue(task: ScheduledTask, nowMs: number): boolean {
   const since = task.lastRunMs ?? new Date(task.createdAt).getTime()
   return nextRunMs(task.spec, since) <= nowMs
+}
+
+// ---- notify bridge (opt-in job-complete webhook ping, Phase 10.3) ----
+import { redactSessionText } from "../session/session.ts"
+
+export interface ScheduleNotifyPayload {
+  event: "schedule.completed"
+  taskId: string
+  command: string
+  ok: boolean
+  durationMs: number
+  output: string
+}
+
+/** Build the webhook POST body for a completed scheduled run. Both `command`
+ * (a stored schedule can itself contain a pasted credential, e.g. in a flag
+ * or URL) and `output` are redacted the same way session transcripts are —
+ * a notify payload leaves the local machine, so it's just as much an
+ * exfiltration risk as a saved/shared session (Codex review, PR #1207). */
+export function buildScheduleNotifyPayload(
+  task: ScheduledTask,
+  result: { ok: boolean; durationMs: number; output: string },
+): ScheduleNotifyPayload {
+  return {
+    event: "schedule.completed",
+    taskId: task.id,
+    command: redactSessionText(task.command),
+    ok: result.ok,
+    durationMs: result.durationMs,
+    output: redactSessionText(result.output),
+  }
 }
 
 // ---- persistence (thin fs wrappers; ~/.config/secapi/schedules.json, 0600) ----
